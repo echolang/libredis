@@ -266,14 +266,15 @@ test a_blocking_command_waits_its_timeout_on_top_of_the_options_one
 {
     Fake $f = fake(function(Wire $w) : void {
         $w->welcome();
-        $w->expect('BLPOP q 0.3');
-        time::sleep(time::duration::millis(250));
+        $w->expect('BLPOP q 1.5');
+        // past the timeout (0.1 s), well within the timeout plus the wait (1.6 s)
+        time::sleep(time::duration::millis(800));
         $w->send("*2\r\n$1\r\nq\r\n$1\r\nx\r\n");
     });
     redis::Options $o = optionsFor($f);
     $o->timeout = time::duration::millis(100);
     redis::Connection $r = login($o);
-    redis::KeyedValue? $kv = expect($r->blPop(['q'], time::duration::millis(300)))->ok();
+    redis::KeyedValue? $kv = expect($r->blPop(['q'], time::duration::millis(1500)))->ok();
     assert(($kv?->value ?? '') == 'x');
     $f->server->join();
 }
@@ -560,20 +561,21 @@ test two_blocking_commands_in_a_pipeline_get_both_waits
 {
     Fake $f = fake(function(Wire $w) : void {
         $w->welcome();
-        $w->expect('BLPOP a 0.3');
-        $w->expect('BLPOP b 0.3');
-        // the server runs them one after the other: the second answer comes after both waits
-        time::sleep(time::duration::millis(280));
+        $w->expect('BLPOP a 1.5');
+        $w->expect('BLPOP b 1.5');
+        // the server runs them one after the other: the second answer comes after both waits,
+        // past timeout plus one wait (1.6 s), well short of timeout plus both (3.1 s)
+        time::sleep(time::duration::millis(1200));
         $w->send("*2\r\n$1\r\na\r\n$1\r\nx\r\n");
-        time::sleep(time::duration::millis(280));
+        time::sleep(time::duration::millis(1200));
         $w->send("*2\r\n$1\r\nb\r\n$1\r\ny\r\n");
     });
     redis::Options $o = optionsFor($f);
     $o->timeout = time::duration::millis(100);
     redis::Connection $r = login($o);
     redis::Pipeline $p = $r->pipeline();
-    redis::Deferred<redis::KeyedValue?> $first = $p->blPop(['a'], time::duration::millis(300));
-    redis::Deferred<redis::KeyedValue?> $second = $p->blPop(['b'], time::duration::millis(300));
+    redis::Deferred<redis::KeyedValue?> $first = $p->blPop(['a'], time::duration::millis(1500));
+    redis::Deferred<redis::KeyedValue?> $second = $p->blPop(['b'], time::duration::millis(1500));
     expect($p->run())->fine();
     assert((expect($second->value())->ok()?->value ?? '') == 'y');
     $f->server->join();

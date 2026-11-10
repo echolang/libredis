@@ -445,8 +445,8 @@ test a_cluster_pipeline_keeps_the_blocking_allowance
         if ($c != null) {
             return $c ?? '';
         }
-        // longer than the timeout, within the timeout plus the wait
-        time::sleep(time::duration::millis(250));
+        // longer than the timeout (0.1 s), well within the timeout plus the wait (1.6 s)
+        time::sleep(time::duration::millis(800));
         return "*2\r\n$1\r\nq\r\n$1\r\nx\r\n";
     });
     $book->set('map', "0-16383@{$a->port}");
@@ -457,7 +457,7 @@ test a_cluster_pipeline_keeps_the_blocking_allowance
         die("cluster: {$e}");
     }
     redis::Pipeline $p = $c->pipeline();
-    redis::Deferred<redis::KeyedValue?> $pop = $p->blPop(['q'], time::duration::millis(300));
+    redis::Deferred<redis::KeyedValue?> $pop = $p->blPop(['q'], time::duration::millis(1500));
     fine($p->run());
     assert((must($pop->value())?->value ?? '') == 'x');
     $c->close();
