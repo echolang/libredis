@@ -400,7 +400,8 @@ test a_cluster_transaction_needs_one_slot
 test a_cluster_with_no_seed_that_answers_is_refused
 {
     redis::Options $o = redis::Options();
-    $o->connectTimeout = time::duration::millis(500);
+    // Windows retries a refused SYN for about two seconds before it says so
+    $o->connectTimeout = time::duration::secs(10);
     // a port nothing listens on
     tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
         die("{$e}");

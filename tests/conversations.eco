@@ -112,6 +112,7 @@ test resp2_asks_hello_2_and_reads_its_flat_answer
     $f->server->join();
 }
 
+#[if: os != windows]
 test a_unix_socket_works_like_tcp
 {
     int32 $pid = std::env::pid();
@@ -127,6 +128,7 @@ test a_unix_socket_works_like_tcp
     expect($r->ping())->fine();
     $f->server->join();
 }
+#[end]
 
 test replies_that_arrive_a_byte_at_a_time_read_the_same
 {
