@@ -1,0 +1,658 @@
+namespace redis;
+
+use std::time;
+
+/**
+ * Anything that runs one command and hands back its reply: a `Connection`, a `Pool`, a `Cluster`.
+ * The typed commands are written over this, so they work on all three.
+ */
+public interface Caller
+{
+    function call(const Command& $command, by: tcp::Deadline? $by = null) : result<Reply, Error>;
+}
+
+/**
+ * What the server said about itself at login.
+ */
+internal struct Hello
+{
+    internal string $version = '';
+    internal int64 $id = 0;
+    internal Protocol $protocol = .resp2;
+    internal string $mode = '';
+}
+
+#[docs::groups: ["Opening", "Commands", "Pipelines and transactions", "Session"]]
+
+/**
+ * One connection to a Redis server. Every typed command is a method (`get`, `hset`, `zadd`,
+ * `xadd`...), and `call` runs anything else. Not for sharing between threads: a `Pool` lends
+ * connections out one thread at a time.
+ *
+ * ```echo
+ * redis::Connection $r = guard redis::Connection::open('redis://127.0.0.1:6379');
+ * guard $r->set('greeting', 'hello');
+ * string? $g = guard $r->get('greeting');
+ * ```
+ *
+ * The handle's count is atomic because a pool hands connections from thread to thread; the
+ * connection itself is still used by one thread at a time.
+ */
+#[atomic]
+public class Connection : Caller, Runner, Atomic, Strings, Keys, Hashes, Lists, Sets, SortedSets, Streams, Scripting, Server
+{
+    /**
+     * The server's version as it reported it at login (`7.2.4`). Empty when it did not, as
+     * servers older than 6 do not.
+     */
+    #[docs::group: "Session"]
+    public const string $version;
+
+    /**
+     * The connection's id on the server (`CLIENT ID`), or 0 when it was not reported.
+     */
+    #[docs::group: "Session"]
+    public const int64 $id;
+
+    /**
+     * The protocol the connection speaks: the one asked for, or RESP2 from a server too old for
+     * RESP3.
+     */
+    #[docs::group: "Session"]
+    public const Protocol $protocol;
+
+    /**
+     * `standalone`, `cluster` or `sentinel`, as the server reported it. Empty when it did not.
+     */
+    #[docs::group: "Session"]
+    public const string $mode;
+
+    internal Channel $channel;
+    internal Options $options;
+    // the database SELECT last chose
+    internal uint32 $database;
+    // keys are watched: the next EXEC, UNWATCH, DISCARD or RESET lets go of them
+    internal bool $watching;
+    // a command changed the session in a way only RESET undoes (a raw SELECT, MULTI, CLIENT ...)
+    internal bool $tainted;
+
+    internal constructor(Channel $channel, Options $options, Hello $hello)
+    {
+        $this->version = $hello->version;
+        $this->id = $hello->id;
+        $this->protocol = $hello->protocol;
+        $this->mode = $hello->mode;
+        $this->channel = $channel;
+        $this->options = $options;
+        $this->database = $options->database;
+        $this->watching = false;
+        $this->tainted = false;
+    }
+
+    destructor()
+    {
+        $this->channel->close();
+    }
+
+    /**
+     * Connect to the server a URL names: `redis://user:password@host:port/db`.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const string& $url) : result<Connection, Error>
+    {
+        Options $o = try Options::parse($url);
+        return Connection::open($o);
+    }
+
+    /**
+     * Connect and log in (`HELLO`, `AUTH`, `SELECT`), all within `connectTimeout`.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const Options& $o) : result<Connection, Error>
+    {
+        tcp::Deadline $by = tcp::Deadline(after: $o->connectTimeout);
+        tcp::Stream $stream = try dial($o, $by);
+        Channel $ch = Channel($stream, $o->maxReply);
+        Hello $hello = guard login($ch, $o, $by) else ($e) {
+            $ch->close();
+            return .error($e);
+        }
+        return .ok(Connection($ch, $o, $hello));
+    }
+
+    /**
+     * True while the socket is open. Does not talk to the server; `ping` does.
+     */
+    #[docs::group: "Session"]
+    public const function alive() : bool
+    {
+        return $this->channel->alive();
+    }
+
+    /**
+     * Run one command and read its reply. An error reply is `Error::server`.
+     *
+     * ```echo
+     * redis::Reply $r = guard $db->call(redis::Command(['CONFIG', 'GET', 'maxmemory']));
+     * ```
+     */
+    #[docs::group: "Commands"]
+    public function call(const Command& $command, by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        try $this->admit($command);
+        tcp::Deadline $until = $this->deadline($by, $command->blocks());
+        try $this->channel->send($command, $until);
+        Reply $r = try $this->channel->next($until);
+        return answer(mv $r);
+    }
+
+    /**
+     * Run a command given as its name and arguments: `['CLIENT', 'INFO']`. The commands that
+     * turn a connection into a listener (`SUBSCRIBE` and its kin, `MONITOR`) are refused: a
+     * `Subscriber` is the connection for them.
+     */
+    #[docs::group: "Commands"]
+    public function call(const array<string>& $args, by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        Command $c = Command($args);
+        return $this->call($c, by: $by);
+    }
+
+    /**
+     * A pipeline on this connection: commands queued, then sent in one write by `run`.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function pipeline() : Pipeline
+    {
+        return Pipeline($this);
+    }
+
+    /**
+     * A transaction on this connection: commands queued, then run together by `exec`.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function multi() : Transaction
+    {
+        return Transaction($this);
+    }
+
+    /**
+     * Watch keys for the next transaction: its `exec` runs nothing, and fails as `.aborted`, if
+     * another client changes one of them first.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function watch(const array<string>& $keys, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        Command $c = Command('WATCH');
+        $c->plain();
+        $c->keys($keys);
+        try $this->call($c, by: $by);
+        $this->watching = true;
+        return .ok;
+    }
+
+    /**
+     * Stop watching every key.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function unwatch(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(Command('UNWATCH'), by: $by);
+        $this->watching = false;
+        return .ok;
+    }
+
+    /**
+     * Run `$work` as an optimistic transaction: watch `$keys`, let `$work` read with the
+     * connection and queue its writes on the transaction, then `exec`. When a watched key changed
+     * in between, all of it runs again, up to `$attempts` times; after that the answer is
+     * `.aborted`. An error from `$work` stops it, with nothing run.
+     *
+     * ```echo
+     * guard $r->optimistic(['stock:7'], function(redis::Connection $c, redis::Transaction $tx) : status<redis::Error> {
+     *     string? $left = guard $c->get('stock:7');
+     *     int64 $n = str::int($left ?? '0') ?? 0;
+     *     $tx->set('stock:7', str::from($n - 1));
+     *     return .ok;
+     * });
+     * ```
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function optimistic(const array<string>& $keys, function<status<Error>(Connection, Transaction)> $work, uint32 $attempts = 3, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        uint32 $tried = 0;
+        while (true) {
+            $tried++;
+            try $this->watch($keys, by: $by);
+            Transaction $tx = $this->multi();
+            guard $work($this, $tx) else ($e) {
+                status<Error> $dropped = $this->unwatch(by: $by);
+                return .error($e);
+            }
+            status<Error> $ran = $tx->exec(by: $by);
+            if (!$ran->failed()) {
+                return .ok;
+            }
+            match ($ran->failure()) {
+                Error::aborted => {
+                    if ($tried >= $attempts) {
+                        return .error(.aborted);
+                    }
+                },
+                else => {
+                    return $ran;
+                },
+            }
+        }
+    }
+
+    /**
+     * Switch to another logical database.
+     */
+    #[docs::group: "Session"]
+    public function select(uint32 $database, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        Command $c = Command('SELECT');
+        $c->plain();
+        $c->arg($database as int64);
+        try $this->call($c, by: $by);
+        $this->database = $database;
+        return .ok;
+    }
+
+    /**
+     * Undo what a borrower left behind before the connection is lent again: `RESET` when a raw
+     * command changed the session, else `UNWATCH` when keys are watched, then `SELECT` when the
+     * database is not the options' one. Each step gets `$within`; nothing to undo sends nothing.
+     */
+    internal function restore(time::duration $within) : status<Error>
+    {
+        if (!$this->tainted && !$this->watching && $this->database == $this->options->database) {
+            return .ok;
+        }
+        // a server that does not answer in time costs the connection, not the thread
+        tcp::Deadline $by = tcp::Deadline(after: $within);
+        if ($this->tainted) {
+            try $this->reset(by: $by);
+        } else if ($this->watching) {
+            try $this->unwatch(by: $by);
+        }
+        if ($this->database != $this->options->database) {
+            try $this->select($this->options->database, by: $by);
+        }
+        return .ok;
+    }
+
+    /**
+     * Put the session back the way login left it: no transaction, nothing watched, no
+     * subscriptions or tracking, the database of the options. `RESET` and a fresh login on
+     * Redis 6.2 and later (`RESET` logs out and falls back to RESP2); `DISCARD`, `UNWATCH` and
+     * `SELECT` before that.
+     */
+    #[docs::group: "Session"]
+    public function reset(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        tcp::Deadline $until = $this->deadline($by, null);
+        result<Reply, Error> $r = $this->call(Command('RESET'), by: $until);
+        if (!$r->failed()) {
+            Hello $h = guard login($this->channel, $this->options, $until) else ($e) {
+                $this->channel->close();
+                return .error($e);
+            }
+            $this->database = $this->options->database;
+            $this->watching = false;
+            $this->tainted = false;
+            return .ok;
+        }
+        Error $e = $r->failure();
+        if (!$e->is('ERR')) {
+            return .error($e);
+        }
+        // before 6.2: by hand, and a DISCARD outside MULTI is an error that changes nothing
+        result<Reply, Error> $d = $this->call(Command('DISCARD'), by: $until);
+        if ($d->failed() && $d->failure()->server() == null) {
+            return .error($d->failure());
+        }
+        guard $this->unwatch(by: $until) else ($ue) {
+            return .error($ue);
+        }
+        guard $this->select($this->options->database, by: $until) else ($se) {
+            return .error($se);
+        }
+        // CLIENT settings stay as they are before 6.2: only RESET undoes them
+        $this->tainted = false;
+        return .ok;
+    }
+
+    /**
+     * Hear the RESP3 pushes that arrive between replies: client tracking invalidations, mostly.
+     */
+    #[docs::group: "Session"]
+    public function onPush(function<void(Reply)> $hook) : void
+    {
+        $this->channel->onPush = $hook;
+    }
+
+    /**
+     * Close the connection. Anything still owed is dropped.
+     */
+    #[docs::group: "Session"]
+    public function close() : void
+    {
+        $this->channel->close();
+    }
+
+    /**
+     * Send a pipeline's commands in one write, then read a reply for each.
+     */
+    internal function exchange(Batch $batch, tcp::Deadline? $by) : void
+    {
+        guard $this->admit($batch) else ($ae) {
+            $batch->fail($ae);
+            return;
+        }
+        tcp::Deadline $until = $this->batchDeadline($by, $batch);
+        string $out = $batch->wire();
+        guard $this->channel->write($out, $until) else ($e) {
+            $batch->fail($e);
+            return;
+        }
+        array<Reply> $replies = arr::room<Reply>($batch->commands->count());
+        usize $i = 0;
+        while ($i < $batch->commands->count()) {
+            Reply $r = guard $this->channel->next($until) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            $replies->push(mv $r);
+            $i++;
+        }
+        $batch->settle(mv $replies);
+    }
+
+    /**
+     * Run a transaction's commands: `MULTI`, the commands, `EXEC`, in one write. The replies
+     * are EXEC's; the batch fails when the transaction did not run.
+     */
+    internal function transact(Batch $batch, tcp::Deadline? $by) : void
+    {
+        guard $this->admit($batch) else ($ae) {
+            $batch->fail($ae);
+            return;
+        }
+        tcp::Deadline $until = $this->batchDeadline($by, $batch);
+        // EXEC lets go of watched keys whatever happens
+        $this->watching = false;
+        string $out = '';
+        $out->reserve($batch->size() + 32);
+        Command('MULTI')->into($out);
+        $batch->into($out);
+        Command('EXEC')->into($out);
+        guard $this->channel->write($out, $until) else ($e) {
+            $batch->fail($e);
+            return;
+        }
+        // MULTI's OK, one QUEUED per command (or why it was refused), then EXEC's
+        usize $count = $batch->commands->count();
+        ServerError? $refused = null;
+        usize $i = 0;
+        while ($i < $count + 2) {
+            Reply $r = guard $this->channel->next($until) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            if ($i == $count + 1) {
+                $this->settleExec(mv $r, $batch, $refused);
+                return;
+            }
+            ServerError? $no = $r->failure();
+            if ($no != null && $refused == null) {
+                $refused = $no;
+            }
+            $i++;
+        }
+    }
+
+    private function settleExec(mv Reply $exec, Batch $batch, ServerError? $refused) : void
+    {
+        if ($exec->isNil()) {
+            $batch->fail(.aborted);
+            return;
+        }
+        ServerError? $abort = $exec->failure();
+        if ($abort != null) {
+            ServerError $a = guard $abort;
+            ServerError? $first = $refused;
+            if ($first != null) {
+                ServerError $f = guard $first;
+                $a = ServerError($a->code, "{$a->message} {$f->code} {$f->message}");
+            }
+            $batch->fail(.server($a));
+            return;
+        }
+        array<Reply> $items = guard $exec->items() else {
+            $batch->fail(.unexpected("EXEC answered {$exec->kind()}"));
+            return;
+        }
+        if ($items->count() != $batch->commands->count()) {
+            $batch->fail(.unexpected("EXEC answered {$items->count()} replies for {$batch->commands->count()} commands"));
+            return;
+        }
+        $batch->settle(mv $items);
+    }
+
+    /**
+     * Refuse a command that would make the connection a listener, and note one that changes the
+     * session for good.
+     */
+    private function admit(const Command& $command) : status<Error>
+    {
+        match ($command->session()) {
+            Session::listens => {
+                return .error(.invalid("{$command->name()} makes the connection a listener: use a redis::Subscriber"));
+            },
+            Session::alters => {
+                $this->tainted = true;
+            },
+            Session::plain => {},
+        }
+        return .ok;
+    }
+
+    /**
+     * `admit` for every command of a batch, before any of them is sent.
+     */
+    private function admit(Batch $batch) : status<Error>
+    {
+        foreach ($batch->commands as const &$c) {
+            try $this->admit($c);
+        }
+        return .ok;
+    }
+
+    /**
+     * A batch's deadline: the one named, or the timeout plus what its blocking commands may
+     * hold back. The server runs them one after the other, so their waits add up.
+     */
+    private const function batchDeadline(tcp::Deadline? $by, Batch $batch) : tcp::Deadline
+    {
+        if ($by != null) {
+            tcp::Deadline $given = guard $by;
+            return $given;
+        }
+        time::duration? $total = null;
+        foreach ($batch->commands as const &$c) {
+            time::duration? $b = $c->blocks();
+            if ($b != null) {
+                time::duration $d = guard $b;
+                if ($d->as_millis() == 0) {
+                    return tcp::Deadline::never();
+                }
+                time::duration $sum = $d;
+                if ($total != null) {
+                    time::duration $t = guard $total;
+                    $sum = $t + $d;
+                }
+                $total = $sum;
+            }
+        }
+        return $this->deadline(null, $total);
+    }
+
+    /**
+     * The deadline of a call: the one it names, or `Options->timeout` from now, plus how long a
+     * blocking command may hold its reply back.
+     */
+    internal const function deadline(tcp::Deadline? $by, time::duration? $block) : tcp::Deadline
+    {
+        return $this->options->deadline($by, $block);
+    }
+}
+
+/**
+ * An error reply as `Error::server`; any other reply as it is.
+ */
+internal function answer(mv Reply $r) : result<Reply, Error>
+{
+    match ($r) {
+        Reply::error($s) => {
+            return .error(.server($s));
+        },
+        else => {},
+    }
+    return .ok(mv $r);
+}
+
+internal function dial(const Options& $o, tcp::Deadline $by) : result<tcp::Stream, Error>
+{
+    string? $socket = $o->socket;
+    if ($socket != null) {
+        string $path = guard $socket;
+        tcp::Stream $u = guard tcp::Stream::connect(tcp::Address(unix: $path), $by) else ($e) {
+            return .error(transportError($e));
+        }
+        return .ok($u);
+    }
+    tcp::Stream $s = guard tcp::Stream::connect(host: $o->host, $o->port, $by) else ($e) {
+        return .error(transportError($e));
+    }
+    return .ok($s);
+}
+
+/**
+ * Log in: `HELLO` with the protocol, the credentials and the client name, and `SELECT` with it
+ * in the same write. A server that does not know `HELLO` (older than 6) gets `AUTH`,
+ * `CLIENT SETNAME` and `SELECT` instead, and speaks RESP2.
+ */
+internal function login(Channel $ch, const Options& $o, tcp::Deadline $by) : result<Hello, Error>
+{
+    Command $hello = Command('HELLO');
+    $hello->arg($o->protocol->number());
+    string? $password = $o->password;
+    if ($password != null) {
+        string $pass = guard $password;
+        $hello->arg('AUTH')->arg($o->username ?? 'default')->arg($pass);
+    }
+    if (!$o->clientName->empty()) {
+        $hello->arg('SETNAME')->arg($o->clientName);
+    }
+    string $out = '';
+    $hello->into($out);
+    if ($o->database != 0) {
+        Command $select = Command('SELECT');
+        $select->arg($o->database as int64);
+        $select->into($out);
+    }
+    try $ch->write($out, $by);
+    Reply $said = try $ch->next($by);
+    Reply? $selected = null;
+    if ($o->database != 0) {
+        Reply $s = try $ch->next($by);
+        $selected = $s;
+    }
+
+    ServerError? $refused = $said->failure();
+    if ($refused != null) {
+        ServerError $no = guard $refused;
+        // a server older than 6 knows no HELLO: the old way, in RESP2
+        if ($no->code == 'NOPROTO' || ($no->code == 'ERR' && $no->message->contains('unknown command'))) {
+            return legacyLogin($ch, $o, $by);
+        }
+        return .error(.server($no));
+    }
+    if ($selected != null) {
+        Reply $sel = guard $selected;
+        ServerError? $bad = $sel->failure();
+        if ($bad != null) {
+            ServerError $b = guard $bad;
+            return .error(.server($b));
+        }
+    }
+
+    Hello $h = Hello($protocol: $o->protocol);
+    array<Pair> $fields = guard $said->pairs() else {
+        return .error(.unexpected("HELLO answered {$said->kind()}, not a map"));
+    }
+    foreach ($fields as const &$f) {
+        string $name = $f->key->text() ?? '';
+        if ($name == 'version') {
+            $h->version = $f->value->text() ?? '';
+        } else if ($name == 'id') {
+            $h->id = $f->value->int() ?? 0;
+        } else if ($name == 'mode') {
+            $h->mode = $f->value->text() ?? '';
+        } else if ($name == 'proto') {
+            if (($f->value->int() ?? 0) == 2) {
+                $h->protocol = Protocol::resp2;
+            }
+        }
+    }
+    return .ok($h);
+}
+
+internal function legacyLogin(Channel $ch, const Options& $o, tcp::Deadline $by) : result<Hello, Error>
+{
+    string $out = '';
+    uint32 $sent = 0;
+    string? $password = $o->password;
+    if ($password != null) {
+        string $pass = guard $password;
+        Command $auth = Command('AUTH');
+        string? $user = $o->username;
+        if ($user != null) {
+            string $u = guard $user;
+            $auth->arg($u);
+        }
+        $auth->arg($pass);
+        $auth->into($out);
+        $sent++;
+    }
+    if (!$o->clientName->empty()) {
+        ServerCommands::clientSetName($o->clientName)->into($out);
+        $sent++;
+    }
+    if ($o->database != 0) {
+        Command $select = Command('SELECT');
+        $select->arg($o->database as int64);
+        $select->into($out);
+        $sent++;
+    }
+    if ($sent > 0) {
+        try $ch->write($out, $by);
+    }
+    ServerError? $first = null;
+    uint32 $i = 0;
+    while ($i < $sent) {
+        Reply $r = try $ch->next($by);
+        ServerError? $no = $r->failure();
+        if ($no != null && $first == null) {
+            $first = $no;
+        }
+        $i++;
+    }
+    if ($first != null) {
+        ServerError $f = guard $first;
+        return .error(.server($f));
+    }
+    return .ok(Hello());
+}

@@ -1,0 +1,559 @@
+/**
+ * The cluster client against fake nodes: routing by slot, every redirect, a node that goes away,
+ * pipelines split by node, and keys found from the command table.
+ */
+
+use std::thread;
+use std::time;
+
+/**
+ * Notes the fake nodes share across their threads: what the slot map says, who served what.
+ */
+#[atomic]
+internal class Book
+{
+    private thread::mutex<map<string, string>> $notes;
+
+    internal constructor()
+    {
+        $this->notes = thread::mutex<map<string, string>>(map<string, string>());
+    }
+
+    internal function set(const string& $k, const string& $v) : void
+    {
+        thread::locked<map<string, string>> $n = $this->notes->lock();
+        $n->value[$k] = $v;
+    }
+
+    internal function get(const string& $k) : string
+    {
+        thread::locked<map<string, string>> $n = $this->notes->lock();
+        if (!$n->value->has($k)) {
+            return '';
+        }
+        return $n->value[$k];
+    }
+
+    /**
+     * Add one to the count under `$k`, and answer it.
+     */
+    internal function count(const string& $k) : int64
+    {
+        thread::locked<map<string, string>> $n = $this->notes->lock();
+        int64 $now = 1;
+        if ($n->value->has($k)) {
+            $now = (str::int($n->value[$k]) ?? 0) + 1;
+        }
+        $n->value[$k] = str::from($now);
+        return $now;
+    }
+}
+
+/**
+ * `CLUSTER SLOTS` for a map in `$book` under `map`: `start-end@port` entries, comma separated.
+ */
+internal function slotsReply(Book $book) : string
+{
+    array<string> $ranges = str::split($book->get('map'), ',')->owned();
+    string $out = "*{$ranges->count()}\r\n";
+    foreach ($ranges as const &$r) {
+        usize $dash = $r->find('-');
+        usize $at = $r->find('@');
+        string $from = $r->sub(0, $dash);
+        string $to = $r->sub($dash + 1, $at - $dash - 1);
+        string $port = $r->sub($at + 1, $r->size() - $at - 1);
+        $out->append("*3\r\n:{$from}\r\n:{$to}\r\n*3\r\n$9\r\n127.0.0.1\r\n:{$port}\r\n$4\r\nnode\r\n");
+    }
+    return $out;
+}
+
+/**
+ * What every fake node answers the same: HELLO, CLUSTER SLOTS, ASKING, COMMAND INFO. Null for
+ * anything else.
+ */
+internal function common(Book $book, const array<string>& $a) : string?
+{
+    string $cmd = str::upper($a[0]);
+    if ($cmd == 'HELLO') {
+        string? $h = helloMap(1);
+        return $h;
+    }
+    if ($cmd == 'CLUSTER') {
+        $book->count('slots asked');
+        string? $s = slotsReply($book);
+        return $s;
+    }
+    if ($cmd == 'ASKING') {
+        string? $ok = "+OK\r\n";
+        return $ok;
+    }
+    if ($cmd == 'COMMAND') {
+        $book->count('command info');
+        // GET and STRLEN: one key, at 1; EVAL: keys that move about
+        if ($a[2] == 'eval') {
+            string? $ev = "*1\r\n*6\r\n$4\r\neval\r\n:-3\r\n*1\r\n+movablekeys\r\n:0\r\n:0\r\n:0\r\n";
+            return $ev;
+        }
+        string? $info = "*1\r\n*6\r\n$3\r\nget\r\n:2\r\n*1\r\n+readonly\r\n:1\r\n:1\r\n:1\r\n";
+        return $info;
+    }
+    string? $none = null;
+    return $none;
+}
+
+internal function clusterOf(const string& $seed) : redis::Cluster
+{
+    redis::Options $o = redis::Options();
+    $o->connectTimeout = time::duration::secs(2);
+    redis::ClusterOptions $limits = redis::ClusterOptions();
+    $limits->pool->pingAfterIdle = time::duration::secs(60);
+    redis::Cluster $c = guard redis::Cluster::open([$seed], $o, $limits) else ($e) {
+        die("cluster: {$e}");
+    }
+    return $c;
+}
+
+test the_cluster_learns_the_slot_map_and_routes_each_key_to_its_node
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        $book->count('A');
+        return "$1\r\nA\r\n";
+    });
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        $book->count('B');
+        return "$1\r\nB\r\n";
+    });
+    $book->set('map', "0-8191@{$a->port},8192-16383@{$b->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert($c->nodes()->count() == 2);
+    // foo is slot 12182, bar 5061
+    assert((must($c->get('foo')) ?? '') == 'B');
+    assert((must($c->get('bar')) ?? '') == 'A');
+    assert((must($c->get('{bar}:x')) ?? '') == 'A');
+    // keyless commands take turns
+    must($c->call(['PING']));
+    must($c->call(['PING']));
+    assert($book->get('A') == '3' && $book->get('B') == '2');
+    // an untyped command's keys come from COMMAND INFO, asked once
+    assert((must($c->call(['GET', 'foo']))->text() ?? '') == 'B');
+    assert((must($c->call(['GET', 'foo']))->text() ?? '') == 'B');
+    assert($book->get('command info') == '1');
+    assert(fails($c->mGet(['foo', 'bar']))->name() == 'crossSlot');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+
+test whole_keyspace_reads_are_refused_and_node_wide_writes_reach_every_primary
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        $book->count("A {$args[0]}");
+        return "$3\r\nlib\r\n";
+    });
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        $book->count("B {$args[0]}");
+        return "$3\r\nlib\r\n";
+    });
+    $book->set('map', "0-8191@{$a->port},8192-16383@{$b->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert($c->primaries()->count() == 2);
+    // one primary's answer would pass for the whole cluster's: refused before anything is sent
+    assert(fails($c->scan('0'))->name() == 'unroutable');
+    assert(fails($c->keys('*'))->name() == 'unroutable');
+    assert(fails($c->dbSize())->name() == 'unroutable');
+    assert(fails($c->call(['randomkey']))->name() == 'unroutable');
+    assert($book->get('command info') == '');
+    // each primary runs it, so a function called on any slot finds it
+    assert(must($c->functionLoad('#!lua name=lib')) == 'lib');
+    assert($book->get('A FUNCTION') == '1' && $book->get('B FUNCTION') == '1');
+    assert(must($c->scriptLoad('return 1')) == 'lib');
+    must($c->call(['FLUSHDB']));
+    assert($book->get('A SCRIPT') == '1' && $book->get('B SCRIPT') == '1');
+    assert($book->get('A FLUSHDB') == '1' && $book->get('B FLUSHDB') == '1');
+    // in a pipeline the same, each by itself; in a transaction they have no one place to run
+    redis::Pipeline $p = $c->pipeline();
+    redis::Deferred<string> $loaded = $p->functionLoad('#!lua name=lib');
+    fine($p->run());
+    assert(must($loaded->value()) == 'lib');
+    assert($book->get('A FUNCTION') == '2' && $book->get('B FUNCTION') == '2');
+    redis::Pipeline $bad = $c->pipeline();
+    redis::Deferred<int64> $size = $bad->dbSize();
+    assert(failsStatus($bad->run())->name() == 'unroutable');
+    redis::Transaction $tx = $c->multi();
+    redis::Deferred<string> $inTx = $tx->scriptLoad('return 1');
+    assert(failsStatus($tx->exec())->name() == 'unroutable');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+
+test moved_points_the_slot_at_its_new_node_and_learns_the_map_again
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "$1\r\nA\r\n";
+    });
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        // the slot of foo went to A: say so, and fix the map the next CLUSTER SLOTS hands out
+        $book->set('map', "0-16383@{$book->get('a port')}");
+        return "-MOVED 12182 127.0.0.1:{$book->get('a port')}\r\n";
+    });
+    $book->set('a port', str::from($a->port));
+    $book->set('map', "0-8191@{$a->port},8192-16383@{$b->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert((must($c->get('foo')) ?? '') == 'A');
+    assert((must($c->get('foo')) ?? '') == 'A');
+    // the whole map was learned again: B's other slots are A's now too
+    assert((must($c->get('{foo}2')) ?? '') == 'A');
+    assert($book->get('slots asked') != '1');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+
+test ask_sends_asking_and_the_command_to_the_other_node_once
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            if ($args[0] == 'ASKING') {
+                $book->count('asking');
+            }
+            return $c ?? '';
+        }
+        return "$1\r\nA\r\n";
+    });
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "-ASK 12182 127.0.0.1:{$book->get('a port')}\r\n";
+    });
+    $book->set('a port', str::from($a->port));
+    $book->set('map', "0-8191@{$a->port},8192-16383@{$b->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert((must($c->get('foo')) ?? '') == 'A');
+    assert($book->get('asking') == '1');
+    // ASK changes nothing for later: B is asked again first
+    assert((must($c->get('foo')) ?? '') == 'A');
+    assert($book->get('asking') == '2');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+
+test tryagain_waits_and_tries_again_and_a_cluster_down_for_good_is_unroutable
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        if ($args[1] == 'busy') {
+            if ($book->count('tries') < 3) {
+                return "-TRYAGAIN Multiple keys request during rehashing of slot\r\n";
+            }
+            return "$2\r\nok\r\n";
+        }
+        return "-CLUSTERDOWN The cluster is down\r\n";
+    });
+    $book->set('map', "0-16383@{$a->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert((must($c->get('busy')) ?? '') == 'ok');
+    assert($book->get('tries') == '3');
+    redis::Error $e = fails($c->get('down'));
+    assert($e->name() == 'unroutable');
+    assert($e->message()->contains('CLUSTERDOWN'));
+    $c->close();
+    $a->stop();
+}
+
+test a_node_that_goes_away_is_found_out_and_routed_around
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "$1\r\nA\r\n";
+    });
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "$1\r\nB\r\n";
+    });
+    $book->set('map', "0-8191@{$a->port},8192-16383@{$b->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    // B goes, and the cluster gives its slots to A
+    $b->stop();
+    $book->set('map', "0-16383@{$a->port}");
+    assert((must($c->get('foo')) ?? '') == 'A');
+    $c->close();
+    $a->stop();
+}
+
+test a_cluster_pipeline_splits_by_node_follows_redirects_and_keeps_the_order
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "$1\r\nA\r\n";
+    });
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        if ($args[1] == 'moved') {
+            // slot 1999 is A's
+            return "-MOVED 1999 127.0.0.1:{$book->get('a port')}\r\n";
+        }
+        return "$2\r\nB.\r\n";
+    });
+    $book->set('a port', str::from($a->port));
+    // the slot of 'moved' is 1999: the map wrongly says B has it
+    $book->set('map', "0-1000@{$a->port},1001-3000@{$b->port},3001-8191@{$a->port},8192-16383@{$b->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert(redis::Cluster::slot('moved') == 1999);
+    redis::Pipeline $p = $c->pipeline();
+    redis::Deferred<string?> $one = $p->get('foo');
+    redis::Deferred<string?> $two = $p->get('bar');
+    redis::Deferred<string?> $three = $p->get('moved');
+    redis::Deferred<string?> $four = $p->get('foo');
+    fine($p->run());
+    assert((must($one->value()) ?? '') == 'B.');
+    assert((must($two->value()) ?? '') == 'A');
+    assert((must($three->value()) ?? '') == 'A');
+    assert((must($four->value()) ?? '') == 'B.');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+
+test a_cluster_transaction_needs_one_slot
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        string $cmd = $args[0];
+        if ($cmd == 'MULTI') {
+            return "+OK\r\n";
+        }
+        if ($cmd == 'EXEC') {
+            return "*2\r\n:1\r\n:2\r\n";
+        }
+        return "+QUEUED\r\n";
+    });
+    $book->set('map', "0-16383@{$a->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    redis::Transaction $tx = $c->multi();
+    redis::Deferred<int64> $x = $tx->incr('{u}a');
+    redis::Deferred<int64> $y = $tx->incr('{u}b');
+    fine($tx->exec());
+    assert(must($x->value()) == 1 && must($y->value()) == 2);
+    redis::Transaction $spread = $c->multi();
+    $spread->incr('a');
+    $spread->incr('b');
+    assert(failsStatus($spread->exec())->name() == 'crossSlot');
+    $c->close();
+    $a->stop();
+}
+
+test a_cluster_with_no_seed_that_answers_is_refused
+{
+    redis::Options $o = redis::Options();
+    $o->connectTimeout = time::duration::millis(500);
+    // a port nothing listens on
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+        die("{$e}");
+    }
+    uint16 $port = $l->local->port;
+    $l->close();
+    redis::Error $e = fails(redis::Cluster::open(["127.0.0.1:{$port}"], $o));
+    assert($e->name() == 'transport');
+    assert(fails(redis::Cluster::open(array<string>()))->name() == 'invalid');
+    assert(fails(redis::Cluster::open(['nocolon']))->name() == 'invalid');
+}
+
+test a_redirect_parses_its_slot_and_address
+{
+    redis::Redirect $r = redis::Redirect::parse(redis::ServerError('MOVED', '3999 127.0.0.1:6381'), 'h')->unwrap();
+    assert($r->slot == 3999 && $r->address == '127.0.0.1:6381');
+    assert($r->node->host == '127.0.0.1' && $r->node->port == 6381);
+    redis::Redirect $v6 = redis::Redirect::parse(redis::ServerError('ASK', '1 [::1]:7000'), 'h')->unwrap();
+    assert($v6->address == '[::1]:7000');
+    assert(redis::Redirect::parse(redis::ServerError('MOVED', '99999 h:1'), 'h')->failed());
+    assert(redis::Redirect::parse(redis::ServerError('MOVED', 'nope'), 'h')->failed());
+    // a node that does not know its own address: the host the command went to
+    redis::Redirect $bare = redis::Redirect::parse(redis::ServerError('MOVED', '1 :7000'), '10.0.0.5')->unwrap();
+    assert($bare->address == '10.0.0.5:7000');
+    redis::Redirect $bare6 = redis::Redirect::parse(redis::ServerError('MOVED', '1 :7000'), '::1')->unwrap();
+    assert($bare6->address == '[::1]:7000');
+    // an address that is not host:port is an error, not a crash
+    assert(redis::Redirect::parse(redis::ServerError('MOVED', '1 somehost'), 'h')->failed());
+    assert(redis::Redirect::parse(redis::ServerError('ASK', '1 ?:abc'), 'h')->failed());
+    assert(redis::Redirect::parse(redis::ServerError('ASK', '1 h:70000'), 'h')->failed());
+    redis::HostPort $hp = redis::splitAddress('[::1]:7000')->unwrap();
+    assert($hp->host == '::1' && $hp->port == 7000);
+    assert(redis::joinAddress('::1', 7000) == '[::1]:7000');
+}
+
+test a_cluster_pipeline_keeps_the_blocking_allowance
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        // longer than the timeout, within the timeout plus the wait
+        time::sleep(time::duration::millis(250));
+        return "*2\r\n$1\r\nq\r\n$1\r\nx\r\n";
+    });
+    $book->set('map', "0-16383@{$a->port}");
+    redis::Options $o = redis::Options();
+    $o->connectTimeout = time::duration::secs(2);
+    $o->timeout = time::duration::millis(100);
+    redis::Cluster $c = guard redis::Cluster::open([$a->address()], $o) else ($e) {
+        die("cluster: {$e}");
+    }
+    redis::Pipeline $p = $c->pipeline();
+    redis::Deferred<redis::KeyedValue?> $pop = $p->blPop(['q'], time::duration::millis(300));
+    fine($p->run());
+    assert((must($pop->value())?->value ?? '') == 'x');
+    $c->close();
+    $a->stop();
+}
+
+test a_redirect_to_an_address_that_is_no_address_is_an_error_not_a_crash
+{
+    Book $book = Book();
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        if ($args[1] == 'foo') {
+            return "-MOVED 12182 somehost\r\n";
+        }
+        return "-ASK 5061 ?:abc\r\n";
+    });
+    $book->set('map', "0-16383@{$a->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert(fails($c->get('foo'))->name() == 'malformed');
+    assert(fails($c->get('bar'))->name() == 'malformed');
+    $c->close();
+    $a->stop();
+}
+
+test a_redirect_without_a_host_goes_to_the_host_that_was_asked
+{
+    Book $book = Book();
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "$1\r\nB\r\n";
+    });
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "-MOVED 12182 :{$book->get('b port')}\r\n";
+    });
+    $book->set('b port', str::from($b->port));
+    $book->set('map', "0-16383@{$a->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert((must($c->get('foo')) ?? '') == 'B');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+
+test threads_redirected_together_learn_the_map_once
+{
+    Book $book = Book();
+    FakeNode $b = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        return "$1\r\nB\r\n";
+    });
+    FakeNode $a = FakeNode(function(array<string> $args) : string {
+        string? $c = common($book, $args);
+        if ($c != null) {
+            return $c ?? '';
+        }
+        // hold every caller a while, so their redirects arrive together
+        time::sleep(time::duration::millis(150));
+        $book->set('map', "0-8191@{$book->get('a port')},8192-16383@{$book->get('b port')}");
+        return "-MOVED 12182 127.0.0.1:{$book->get('b port')}\r\n";
+    });
+    $book->set('a port', str::from($a->port));
+    $book->set('b port', str::from($b->port));
+    $book->set('map', "0-16383@{$a->port}");
+    redis::Cluster $c = clusterOf($a->address());
+    assert($book->get('slots asked') == '1');
+    Tally $right = Tally();
+    array<thread::handle> $callers = array<thread::handle>();
+    int32 $i = 0;
+    while ($i < 6) {
+        thread::handle $h = guard thread::spawn(function() : void {
+            if ((must($c->get('foo')) ?? '') == 'B') {
+                $right->bump();
+            }
+        });
+        $callers->push($h);
+        $i++;
+    }
+    foreach ($callers as $h) {
+        $h->join();
+    }
+    assert($right->get() == 6);
+    assert($book->get('slots asked') == '2');
+    $c->close();
+    $a->stop();
+    $b->stop();
+}
+

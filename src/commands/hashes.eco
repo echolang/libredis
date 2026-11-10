@@ -1,0 +1,377 @@
+/**
+ * The typed commands for hashes: fields and their values under one key: how each is written (`HashCommands`), and the methods that
+ * run them on connections, pools and clusters (`Hashes`) or queue them on pipelines and
+ * transactions (`QueuedHashes`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct HashCommands
+{
+    internal static function hGet(const string& $key, const string& $field) : Command
+    {
+        Command $c = Command('HGET');
+        $c->key($key);
+        $c->arg($field);
+        return $c;
+    }
+
+    internal static function hSet(const string& $key, const ordered_map<string, string>& $fields) : Command
+    {
+        Command $c = Command('HSET');
+        $c->key($key);
+        foreach ($fields as $f => const &$v) {
+            $c->arg($f)->arg($v);
+        }
+        return $c;
+    }
+
+    internal static function hSetNx(const string& $key, const string& $field, const string& $value) : Command
+    {
+        Command $c = Command('HSETNX');
+        $c->key($key);
+        $c->arg($field);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function hmGet(const string& $key, const array<string>& $fields) : Command
+    {
+        Command $c = Command('HMGET');
+        $c->key($key);
+        $c->args($fields);
+        return $c;
+    }
+
+    internal static function hGetAll(const string& $key) : Command
+    {
+        Command $c = Command('HGETALL');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function hDel(const string& $key, const array<string>& $fields) : Command
+    {
+        Command $c = Command('HDEL');
+        $c->key($key);
+        $c->args($fields);
+        return $c;
+    }
+
+    internal static function hExists(const string& $key, const string& $field) : Command
+    {
+        Command $c = Command('HEXISTS');
+        $c->key($key);
+        $c->arg($field);
+        return $c;
+    }
+
+    internal static function hIncrBy(const string& $key, const string& $field, int64 $amount) : Command
+    {
+        Command $c = Command('HINCRBY');
+        $c->key($key);
+        $c->arg($field);
+        $c->arg($amount);
+        return $c;
+    }
+
+    internal static function hIncrByFloat(const string& $key, const string& $field, float64 $amount) : Command
+    {
+        Command $c = Command('HINCRBYFLOAT');
+        $c->key($key);
+        $c->arg($field);
+        $c->arg($amount);
+        return $c;
+    }
+
+    internal static function hKeys(const string& $key) : Command
+    {
+        Command $c = Command('HKEYS');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function hVals(const string& $key) : Command
+    {
+        Command $c = Command('HVALS');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function hLen(const string& $key) : Command
+    {
+        Command $c = Command('HLEN');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function hStrLen(const string& $key, const string& $field) : Command
+    {
+        Command $c = Command('HSTRLEN');
+        $c->key($key);
+        $c->arg($field);
+        return $c;
+    }
+
+    internal static function hScan(const string& $key, const string& $cursor, ScanOptions $options) : Command
+    {
+        Command $c = Command('HSCAN');
+        $c->key($key);
+        $c->arg($cursor);
+        $options->into($c);
+        return $c;
+    }
+}
+
+/**
+ * The commands for hashes: fields and their values under one key, each run as it is called and answered with its reply.
+ */
+public interface Hashes
+{
+    /**
+     * The value of `$field` in the hash at `$key`, or null.
+     */
+    function hGet(const string& $key, const string& $field, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hGet($key, $field), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Set `$fields` in the hash at `$key`, and answer how many were new.
+     */
+    function hSet(const string& $key, const ordered_map<string, string>& $fields, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hSet($key, $fields), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Set `$field` in the hash at `$key` only when it is not there. True when it was set.
+     */
+    function hSetNx(const string& $key, const string& $field, const string& $value, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hSetNx($key, $field, $value), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * The values of `$fields` in the hash at `$key`, in order, null for each that is not there.
+     */
+    function hmGet(const string& $key, const array<string>& $fields, by: tcp::Deadline? $by = null) : result<array<string?>, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hmGet($key, $fields), by: $by);
+        return Decode::maybeTexts($r);
+    }
+
+    /**
+     * Every field of the hash at `$key` with its value. Empty when there is no such key.
+     */
+    function hGetAll(const string& $key, by: tcp::Deadline? $by = null) : result<ordered_map<string, string>, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hGetAll($key), by: $by);
+        return Decode::textMap($r);
+    }
+
+    /**
+     * Delete `$fields` from the hash at `$key`, and answer how many were there.
+     */
+    function hDel(const string& $key, const array<string>& $fields, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hDel($key, $fields), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * True when the hash at `$key` has `$field`.
+     */
+    function hExists(const string& $key, const string& $field, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hExists($key, $field), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * Add `$amount` to the integer in `$field`, and answer the new value.
+     */
+    function hIncrBy(const string& $key, const string& $field, int64 $amount, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hIncrBy($key, $field, $amount), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Add `$amount` to the number in `$field`, and answer the new value.
+     */
+    function hIncrByFloat(const string& $key, const string& $field, float64 $amount, by: tcp::Deadline? $by = null) : result<float64, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hIncrByFloat($key, $field, $amount), by: $by);
+        return Decode::float($r);
+    }
+
+    /**
+     * The fields of the hash at `$key`.
+     */
+    function hKeys(const string& $key, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hKeys($key), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The values of the hash at `$key`.
+     */
+    function hVals(const string& $key, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hVals($key), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * How many fields the hash at `$key` has.
+     */
+    function hLen(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hLen($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The length of the value of `$field`, 0 when it is not there.
+     */
+    function hStrLen(const string& $key, const string& $field, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hStrLen($key, $field), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * One page of the hash at `$key`, from `$cursor` (`'0'` to start).
+     */
+    function hScan(const string& $key, const string& $cursor, ScanOptions $options = ScanOptions(), by: tcp::Deadline? $by = null) : result<FieldPage, Error>
+    {
+        Reply $r = try $this->call(HashCommands::hScan($key, $cursor, $options), by: $by);
+        return Decode::fieldScan($r);
+    }
+}
+
+/**
+ * The commands for hashes: fields and their values under one key, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedHashes
+{
+    /**
+     * The value of `$field` in the hash at `$key`, or null.
+     */
+    function hGet(const string& $key, const string& $field) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(HashCommands::hGet($key, $field)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Set `$fields` in the hash at `$key`, and answer how many were new.
+     */
+    function hSet(const string& $key, const ordered_map<string, string>& $fields) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(HashCommands::hSet($key, $fields)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Set `$field` in the hash at `$key` only when it is not there. True when it was set.
+     */
+    function hSetNx(const string& $key, const string& $field, const string& $value) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(HashCommands::hSetNx($key, $field, $value)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * The values of `$fields` in the hash at `$key`, in order, null for each that is not there.
+     */
+    function hmGet(const string& $key, const array<string>& $fields) : Deferred<array<string?>>
+    {
+        return Deferred<array<string?>>($this->queue(HashCommands::hmGet($key, $fields)), (const Reply& $r) => Decode::maybeTexts($r));
+    }
+
+    /**
+     * Every field of the hash at `$key` with its value. Empty when there is no such key.
+     */
+    function hGetAll(const string& $key) : Deferred<ordered_map<string, string>>
+    {
+        return Deferred<ordered_map<string, string>>($this->queue(HashCommands::hGetAll($key)), (const Reply& $r) => Decode::textMap($r));
+    }
+
+    /**
+     * Delete `$fields` from the hash at `$key`, and answer how many were there.
+     */
+    function hDel(const string& $key, const array<string>& $fields) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(HashCommands::hDel($key, $fields)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * True when the hash at `$key` has `$field`.
+     */
+    function hExists(const string& $key, const string& $field) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(HashCommands::hExists($key, $field)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * Add `$amount` to the integer in `$field`, and answer the new value.
+     */
+    function hIncrBy(const string& $key, const string& $field, int64 $amount) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(HashCommands::hIncrBy($key, $field, $amount)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Add `$amount` to the number in `$field`, and answer the new value.
+     */
+    function hIncrByFloat(const string& $key, const string& $field, float64 $amount) : Deferred<float64>
+    {
+        return Deferred<float64>($this->queue(HashCommands::hIncrByFloat($key, $field, $amount)), (const Reply& $r) => Decode::float($r));
+    }
+
+    /**
+     * The fields of the hash at `$key`.
+     */
+    function hKeys(const string& $key) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(HashCommands::hKeys($key)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The values of the hash at `$key`.
+     */
+    function hVals(const string& $key) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(HashCommands::hVals($key)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * How many fields the hash at `$key` has.
+     */
+    function hLen(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(HashCommands::hLen($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The length of the value of `$field`, 0 when it is not there.
+     */
+    function hStrLen(const string& $key, const string& $field) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(HashCommands::hStrLen($key, $field)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * One page of the hash at `$key`, from `$cursor` (`'0'` to start).
+     */
+    function hScan(const string& $key, const string& $cursor, ScanOptions $options = ScanOptions()) : Deferred<FieldPage>
+    {
+        return Deferred<FieldPage>($this->queue(HashCommands::hScan($key, $cursor, $options)), (const Reply& $r) => Decode::fieldScan($r));
+    }
+}

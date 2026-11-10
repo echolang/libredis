@@ -1,0 +1,88 @@
+namespace redis;
+
+#[docs::groups: ["Running", "Commands"]]
+
+/**
+ * Commands that run together, with no other client's in between: `MULTI`, the commands, `EXEC`,
+ * all in one write. Each command has a `Deferred` handle to its reply, as in a pipeline. With
+ * keys watched first (`Connection::watch`), `exec` fails as `.aborted` and runs nothing when one
+ * of them changed in the meantime.
+ *
+ * ```echo
+ * guard $r->watch(['stock:7']);
+ * redis::Transaction $tx = $r->multi();
+ * $tx->decrBy('stock:7', 1);
+ * $tx->rPush('orders', ['42']);
+ * guard $tx->exec();
+ * ```
+ */
+public class Transaction : QueuedStrings, QueuedKeys, QueuedHashes, QueuedLists, QueuedSets, QueuedSortedSets, QueuedStreams, QueuedScripting, QueuedServer
+{
+    private Atomic $target;
+    private Batch $batch;
+
+    internal constructor(Atomic $target)
+    {
+        $this->target = $target;
+        $this->batch = Batch();
+    }
+
+    /**
+     * Queue any command, for its reply as it came.
+     */
+    #[docs::group: "Commands"]
+    public function add(Command $command) : Deferred<Reply>
+    {
+        return Deferred<Reply>($this->queue(mv $command), (const Reply& $r) => Decode::reply($r));
+    }
+
+    /**
+     * Queue a command given as its name and arguments.
+     */
+    #[docs::group: "Commands"]
+    public function add(const array<string>& $args) : Deferred<Reply>
+    {
+        return $this->add(Command($args));
+    }
+
+    /**
+     * How many commands are queued.
+     */
+    #[docs::group: "Running"]
+    public const function count() : usize
+    {
+        return $this->batch->commands->count();
+    }
+
+    /**
+     * Run the queued commands as one transaction. `.aborted` when a watched key changed: nothing
+     * ran. `EXECABORT` (an `Error::server`, with the first refusal in its message) when the
+     * server refused a command as it was queued, a wrong number of arguments say: nothing ran.
+     * Otherwise each handle has its command's reply, an error reply included: a command that
+     * fails as it runs (`WRONGTYPE`) does not undo the others.
+     */
+    #[docs::group: "Running"]
+    public function exec(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        Batch $b = $this->batch;
+        $this->batch = Batch();
+        $this->target->transact($b, $by);
+        return $b->outcome();
+    }
+
+    /**
+     * Drop what is queued and stop watching keys. Nothing queued has been sent.
+     */
+    #[docs::group: "Running"]
+    public function discard(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        $this->batch = Batch();
+        return $this->target->unwatch(by: $by);
+    }
+
+    internal function queue(Command $command) : Queued
+    {
+        $this->batch->commands->push(mv $command);
+        return Queued($this->batch, $this->batch->commands->count() - 1);
+    }
+}

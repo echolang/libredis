@@ -1,0 +1,344 @@
+namespace redis;
+
+/**
+ * How a message reached a subscriber: on a channel it subscribed to, through a pattern, or on a
+ * shard channel.
+ */
+public enum MessageKind
+{
+    case channel;
+    case pattern;
+    case shard;
+}
+
+/**
+ * One Pub/Sub message.
+ */
+public struct Message
+{
+    public MessageKind $kind;
+    public string $channel;
+
+    /**
+     * The pattern that matched the channel, for `.pattern`; empty otherwise.
+     */
+    public string $pattern;
+    public string $payload;
+}
+
+#[docs::groups: ["Opening", "Subscribing", "Receiving"]]
+
+/**
+ * A connection that listens: `subscribe` to channels, `psubscribe` to patterns of them,
+ * `ssubscribe` to shard channels, then `next` for each message. It remembers what it subscribed
+ * to, and `reconnect` subscribes a new connection to all of it again.
+ *
+ * ```echo
+ * redis::Subscriber $s = guard redis::Subscriber::open($url);
+ * guard $s->subscribe(['news']);
+ * while (true) {
+ *     redis::Message? $m = guard $s->next(tcp::Deadline(ms: 1000));
+ *     ...
+ * }
+ * ```
+ */
+public class Subscriber
+{
+    private Connection $db;
+    private ordered_map<string, bool> $channels;
+    private ordered_map<string, bool> $patterns;
+    private ordered_map<string, bool> $shards;
+    // messages that arrived while a subscription was being confirmed, in order
+    private array<Message> $early;
+
+    internal constructor(Connection $db)
+    {
+        $this->db = $db;
+        $this->db->channel->passPushes = true;
+        $this->channels = ordered_map<string, bool>();
+        $this->patterns = ordered_map<string, bool>();
+        $this->shards = ordered_map<string, bool>();
+        $this->early = array<Message>();
+    }
+
+    #[docs::group: "Opening"]
+    public static function open(const string& $url) : result<Subscriber, Error>
+    {
+        Options $o = try Options::parse($url);
+        return Subscriber::open($o);
+    }
+
+    /**
+     * Open a connection of its own for listening.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const Options& $o) : result<Subscriber, Error>
+    {
+        Connection $db = try Connection::open($o);
+        return .ok(Subscriber($db));
+    }
+
+    #[docs::group: "Opening"]
+    public const function alive() : bool
+    {
+        return $this->db->alive();
+    }
+
+    /**
+     * Listen to `$channels`. Answers once the server confirmed each.
+     */
+    #[docs::group: "Subscribing"]
+    public function subscribe(const array<string>& $channels, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->change('SUBSCRIBE', $channels, $this->channels, true, $by);
+    }
+
+    /**
+     * Stop listening to `$channels`; to every channel when empty.
+     */
+    #[docs::group: "Subscribing"]
+    public function unsubscribe(const array<string>& $channels = array<string>(), by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->change('UNSUBSCRIBE', $channels, $this->channels, false, $by);
+    }
+
+    /**
+     * Listen to every channel matching the globs `$patterns`: `news.*`.
+     */
+    #[docs::group: "Subscribing"]
+    public function psubscribe(const array<string>& $patterns, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->change('PSUBSCRIBE', $patterns, $this->patterns, true, $by);
+    }
+
+    /**
+     * Stop listening to `$patterns`; to every pattern when empty.
+     */
+    #[docs::group: "Subscribing"]
+    public function punsubscribe(const array<string>& $patterns = array<string>(), by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->change('PUNSUBSCRIBE', $patterns, $this->patterns, false, $by);
+    }
+
+    /**
+     * Listen to the shard channels `$channels` (Redis 7). In a cluster they all have to hash to
+     * one slot.
+     */
+    #[docs::group: "Subscribing"]
+    public function ssubscribe(const array<string>& $channels, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->change('SSUBSCRIBE', $channels, $this->shards, true, $by);
+    }
+
+    /**
+     * Stop listening to the shard channels `$channels`; to every one when empty.
+     */
+    #[docs::group: "Subscribing"]
+    public function sunsubscribe(const array<string>& $channels = array<string>(), by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->change('SUNSUBSCRIBE', $channels, $this->shards, false, $by);
+    }
+
+    /**
+     * What it listens to now: channels, patterns and shard channels together.
+     */
+    #[docs::group: "Subscribing"]
+    public const function count() : usize
+    {
+        return $this->channels->count() + $this->patterns->count() + $this->shards->count();
+    }
+
+    /**
+     * The next message, or null when the deadline passed with none: that is no error, and the
+     * connection stays. Without a deadline, waits as long as it takes.
+     */
+    #[docs::group: "Receiving"]
+    public function next(by: tcp::Deadline? $by = null) : result<Message?, Error>
+    {
+        if (!$this->early->empty()) {
+            Message? $first = $this->early[0];
+            $this->early->remove(0);
+            return .ok($first);
+        }
+        tcp::Deadline $until = $by ?? tcp::Deadline::never();
+        while (true) {
+            Reply? $got = try $this->db->channel->wait($until);
+            Reply $r = guard $got else {
+                return .ok(null);
+            }
+            Message? $m = try $this->take($r);
+            if ($m != null) {
+                return .ok($m);
+            }
+        }
+    }
+
+    /**
+     * Ask the server to answer, which also keeps an idle connection from looking dead to
+     * anything in between.
+     */
+    #[docs::group: "Receiving"]
+    public function ping(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        tcp::Deadline $until = $this->db->deadline($by, null);
+        try $this->db->channel->send(ServerCommands::ping(), $until);
+        while (true) {
+            Reply $r = try $this->db->channel->next($until);
+            if (isPong($r)) {
+                return .ok;
+            }
+            Message? $m = try $this->take($r);
+            if ($m != null) {
+                Message $msg = guard $m;
+                $this->early->push($msg);
+            }
+        }
+    }
+
+    /**
+     * Open a new connection with the same options and subscribe it to everything this one
+     * listened to, after the old one broke.
+     */
+    #[docs::group: "Opening"]
+    public function reconnect(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        $this->db->close();
+        Connection $fresh = try Connection::open($this->db->options);
+        $this->db = $fresh;
+        $this->db->channel->passPushes = true;
+        try $this->again('SUBSCRIBE', $this->channels, $by);
+        try $this->again('PSUBSCRIBE', $this->patterns, $by);
+        try $this->again('SSUBSCRIBE', $this->shards, $by);
+        return .ok;
+    }
+
+    #[docs::group: "Opening"]
+    public function close() : void
+    {
+        $this->db->close();
+    }
+
+    /**
+     * Subscribe again to `$names`, when there are any.
+     */
+    private function again(const string& $verb, ordered_map<string, bool>& $set, tcp::Deadline? $by) : status<Error>
+    {
+        if ($set->empty()) {
+            return .ok;
+        }
+        return $this->change($verb, $set->keys(), $set, true, $by);
+    }
+
+    /**
+     * Send a (un)subscribe and read until the server confirmed each name, keeping the messages
+     * that arrive in between for `next`. Then add `$names` to `$set`, or drop them from it.
+     */
+    private function change(const string& $verb, const array<string>& $names, ordered_map<string, bool>& $set, bool $adding, tcp::Deadline? $by) : status<Error>
+    {
+        Command $c = Command($verb);
+        if ($verb == 'SSUBSCRIBE' || $verb == 'SUNSUBSCRIBE') {
+            $c->keys($names);
+        } else {
+            $c->args($names);
+        }
+        tcp::Deadline $until = $this->db->deadline($by, null);
+        try $this->db->channel->send($c, $until);
+        string $confirm = str::lower($verb);
+        usize $owed = $names->count();
+        if ($owed == 0) {
+            // everything at once: one confirmation per name dropped, or one saying none were
+            $owed = $set->count();
+            if ($owed == 0) {
+                $owed = 1;
+            }
+        }
+        while ($owed > 0) {
+            Reply $r = try $this->db->channel->next($until);
+            array<Reply> $items = $r->items() ?? array<Reply>();
+            if (!$items->empty() && ($items[0]->text() ?? '') == $confirm) {
+                $owed--;
+                continue;
+            }
+            Message? $m = try $this->take($r);
+            if ($m != null) {
+                Message $msg = guard $m;
+                $this->early->push($msg);
+            }
+        }
+        if (!$adding) {
+            forgetAll($set, $names);
+            return .ok;
+        }
+        foreach ($names as const &$n) {
+            $set[$n] = true;
+        }
+        return .ok;
+    }
+
+    /**
+     * A push or (RESP2) array as a message. Confirmations and pongs are not one: null. A shard
+     * channel the server dropped (its slot moved) is forgotten.
+     */
+    private function take(const Reply& $r) : result<Message?, Error>
+    {
+        ServerError? $no = $r->failure();
+        if ($no != null) {
+            ServerError $s = guard $no;
+            return .error(.server($s));
+        }
+        array<Reply> $items = guard $r->items() else {
+            return .ok(null);
+        }
+        if ($items->empty()) {
+            return .ok(null);
+        }
+        string $kind = $items[0]->text() ?? '';
+        if ($kind == 'message' && $items->count() == 3) {
+            return .ok(Message(MessageKind::channel, $items[1]->text() ?? '', '', $items[2]->text() ?? ''));
+        }
+        if ($kind == 'smessage' && $items->count() == 3) {
+            return .ok(Message(MessageKind::shard, $items[1]->text() ?? '', '', $items[2]->text() ?? ''));
+        }
+        if ($kind == 'pmessage' && $items->count() == 4) {
+            return .ok(Message(MessageKind::pattern, $items[2]->text() ?? '', $items[1]->text() ?? '', $items[3]->text() ?? ''));
+        }
+        if ($kind == 'sunsubscribe' && $items->count() >= 2) {
+            // the server let go of a shard channel itself: its slot moved to another node
+            string $gone = $items[1]->text() ?? '';
+            if ($this->shards->has($gone)) {
+                $this->shards->remove($gone);
+            }
+        }
+        return .ok(null);
+    }
+}
+
+/**
+ * True for a PING's answer in subscribed mode: `PONG`, or RESP2's `["pong", ""]`.
+ */
+internal function isPong(const Reply& $r) : bool
+{
+    string? $t = $r->text();
+    if ($t != null) {
+        string $text = guard $t;
+        return $text == 'PONG';
+    }
+    array<Reply> $items = $r->items() ?? array<Reply>();
+    return !$items->empty() && ($items[0]->text() ?? '') == 'pong';
+}
+
+/**
+ * Drop `$names` from `$set`; all of it when `$names` is empty.
+ */
+internal function forgetAll(ordered_map<string, bool>& $set, const array<string>& $names) : void
+{
+    if ($names->empty()) {
+        $set->clear();
+        return;
+    }
+    foreach ($names as const &$n) {
+        if ($set->has($n)) {
+            $set->remove($n);
+        }
+    }
+}

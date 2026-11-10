@@ -1,0 +1,263 @@
+namespace redis;
+
+/**
+ * Commands queued to go out together, and once they ran, their replies in the same order. The
+ * `Deferred` handles of a pipeline or a transaction share it.
+ */
+internal class Batch
+{
+    internal array<Command> $commands;
+    internal array<Reply> $replies;
+    internal bool $ran;
+
+    /**
+     * Why the batch as a whole failed, when it did: every handle answers this.
+     */
+    internal Error? $failure;
+
+    internal constructor()
+    {
+        $this->commands = array<Command>();
+        $this->replies = array<Reply>();
+        $this->ran = false;
+        $this->failure = null;
+    }
+
+    /**
+     * Every command, encoded back to back for one write.
+     */
+    internal const function wire() : string
+    {
+        string $out = '';
+        $out->reserve($this->size());
+        $this->into($out);
+        return $out;
+    }
+
+    /**
+     * About how many bytes `wire` takes: enough to reserve once.
+     */
+    internal const function size() : usize
+    {
+        usize $size = 0;
+        foreach ($this->commands as const &$c) {
+            $size = $size + $c->body()->size() + 16;
+        }
+        return $size;
+    }
+
+    /**
+     * Every command, encoded back to back onto `out`.
+     */
+    internal const function into(string& $out) : void
+    {
+        foreach ($this->commands as const &$c) {
+            $c->into($out);
+        }
+    }
+
+    /**
+     * Why the batch failed, when it did.
+     */
+    internal const function outcome() : status<Error>
+    {
+        Error $e = guard $this->failure else {
+            return .ok;
+        }
+        return .error($e);
+    }
+
+    /**
+     * The batch ran, with these replies.
+     */
+    internal function settle(mv array<Reply> $replies) : void
+    {
+        $this->replies = mv $replies;
+        $this->ran = true;
+    }
+
+    /**
+     * The batch could not run, or not to the end: every handle answers `$e`.
+     */
+    internal function fail(Error $e) : void
+    {
+        $this->failure = $e;
+        $this->ran = true;
+    }
+}
+
+/**
+ * Where a queued command's reply will be: its batch and its place in it.
+ */
+internal struct Queued
+{
+    internal Batch $batch;
+    internal usize $at;
+}
+
+/**
+ * The reply of a command in a pipeline or a transaction, read once it ran. Each command fails or
+ * succeeds on its own: one error reply does not spoil the others.
+ *
+ * ```echo
+ * redis::Pipeline $p = $r->pipeline();
+ * redis::Deferred<int64> $n = $p->incr('visits');
+ * redis::Deferred<string?> $name = $p->get('name');
+ * guard $p->run();
+ * int64 $visits = guard $n->value();
+ * ```
+ */
+public class Deferred<T>
+{
+    private Queued $slot;
+    private function<result<T, Error>(const Reply&)> $decode;
+
+    internal constructor(Queued $slot, function<result<T, Error>(const Reply&)> $decode)
+    {
+        $this->slot = $slot;
+        $this->decode = $decode;
+    }
+
+    /**
+     * True once the pipeline or transaction ran, whether or not this command succeeded.
+     */
+    public const function ready() : bool
+    {
+        return $this->slot->batch->ran;
+    }
+
+    /**
+     * The command's reply, read like the immediate command reads it. `.invalid` before the
+     * pipeline ran; the batch's own error when it could not run.
+     */
+    public const function value() : result<T, Error>
+    {
+        Batch $b = $this->slot->batch;
+        if (!$b->ran) {
+            return .error(.invalid('the pipeline or transaction has not run yet'));
+        }
+        try $b->outcome();
+        if ($this->slot->at >= $b->replies->count()) {
+            return .error(.closed);
+        }
+        ServerError? $refused = $b->replies[$this->slot->at]->failure();
+        if ($refused != null) {
+            ServerError $s = guard $refused;
+            return .error(.server($s));
+        }
+        return $this->decode($b->replies[$this->slot->at]);
+    }
+}
+
+/**
+ * Something a pipeline can run on: one connection, a pool, a cluster.
+ */
+internal interface Runner
+{
+    /**
+     * Send the batch's commands and read their replies into it. A failure fails the batch.
+     */
+    function exchange(Batch $batch, tcp::Deadline? $by) : void;
+}
+
+/**
+ * Something a transaction can run on: one connection, or a pool or a cluster that lends one for
+ * the `exec`.
+ */
+internal interface Atomic
+{
+    /**
+     * Run the batch as `MULTI`, its commands, `EXEC`, and read EXEC's replies into it. A failure,
+     * or a transaction that did not run, fails the batch.
+     */
+    function transact(Batch $batch, tcp::Deadline? $by) : void;
+
+    function unwatch(by: tcp::Deadline? $by = null) : status<Error>;
+}
+
+#[docs::groups: ["Running", "Commands"]]
+
+/**
+ * Commands that go out in one write and come back in one read, each with a `Deferred` handle to
+ * its reply. No round trip per command, and no transaction either: other clients' commands may
+ * run between them. Every typed command is a method here too, answering a handle.
+ *
+ * ```echo
+ * redis::Pipeline $p = $r->pipeline();
+ * foreach ($ids as const &$id) {
+ *     $p->hGetAll("user:{$id}");
+ * }
+ * guard $p->run();
+ * ```
+ */
+public class Pipeline : QueuedStrings, QueuedKeys, QueuedHashes, QueuedLists, QueuedSets, QueuedSortedSets, QueuedStreams, QueuedScripting, QueuedServer
+{
+    private Runner $target;
+    private Batch $batch;
+
+    internal constructor(Runner $target)
+    {
+        $this->target = $target;
+        $this->batch = Batch();
+    }
+
+    /**
+     * Queue any command, for its reply as it came.
+     */
+    #[docs::group: "Commands"]
+    public function add(Command $command) : Deferred<Reply>
+    {
+        return Deferred<Reply>($this->queue(mv $command), (const Reply& $r) => Decode::reply($r));
+    }
+
+    /**
+     * Queue a command given as its name and arguments.
+     */
+    #[docs::group: "Commands"]
+    public function add(const array<string>& $args) : Deferred<Reply>
+    {
+        return $this->add(Command($args));
+    }
+
+    /**
+     * How many commands are queued for the next `run`.
+     */
+    #[docs::group: "Running"]
+    public const function count() : usize
+    {
+        return $this->batch->commands->count();
+    }
+
+    /**
+     * Send every queued command and read every reply. The handles answer from here on. An error
+     * reply fails its own handle only; a failure here (the connection went, the deadline passed)
+     * fails them all. The pipeline is empty again after, ready for more.
+     */
+    #[docs::group: "Running"]
+    public function run(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        Batch $b = $this->batch;
+        $this->batch = Batch();
+        if ($b->commands->empty()) {
+            $b->settle(array<Reply>());
+            return .ok;
+        }
+        $this->target->exchange($b, $by);
+        return $b->outcome();
+    }
+
+    /**
+     * Drop what is queued. Handles already given out never get a reply.
+     */
+    #[docs::group: "Running"]
+    public function clear() : void
+    {
+        $this->batch = Batch();
+    }
+
+    internal function queue(Command $command) : Queued
+    {
+        $this->batch->commands->push(mv $command);
+        return Queued($this->batch, $this->batch->commands->count() - 1);
+    }
+}

@@ -1,0 +1,395 @@
+namespace redis;
+
+use std::time;
+
+/**
+ * The RESP version a connection asks for. RESP3 is what Redis 6 and later speak best: typed
+ * replies, maps, and Pub/Sub on any connection. An older server that does not know `HELLO` gets
+ * RESP2 either way.
+ */
+public enum Protocol
+{
+    case resp2;
+    case resp3;
+
+    /**
+     * The number `HELLO` takes.
+     */
+    public const function number() : int64
+    {
+        return match ($this) {
+            Protocol::resp2 => 2,
+            Protocol::resp3 => 3,
+        };
+    }
+}
+
+/**
+ * How to reach the server and how to behave once there. Plain data: fields with defaults, set by
+ * name at construction or by assignment.
+ */
+public struct Options
+{
+    public string $host = '127.0.0.1';
+    public uint16 $port = 6379;
+
+    /**
+     * A unix socket's path. When set, `host` and `port` are not used.
+     */
+    public string? $socket = null;
+
+    /**
+     * The ACL user. Null logs in as `default` when there is a password.
+     */
+    public string? $username = null;
+
+    /**
+     * Null sends no AUTH. Empty is a password, not "no password".
+     */
+    public string? $password = null;
+
+    /**
+     * The logical database `SELECT`ed after login. A cluster has only 0.
+     */
+    public uint32 $database = 0;
+
+    /**
+     * What `CLIENT LIST` shows for the connection. Empty sends nothing.
+     */
+    public string $clientName = '';
+
+    public Protocol $protocol = Protocol::resp3;
+
+    /**
+     * How long connecting and logging in may take, together.
+     */
+    public time::duration $connectTimeout = time::duration::secs(10);
+
+    /**
+     * How long one command may take when the call names no deadline. Null waits forever. A
+     * blocking command (`blpop` and the like) gets its own timeout on top.
+     */
+    public time::duration? $timeout = null;
+
+    /**
+     * The largest reply accepted, in bytes. Redis's own limit on one string is 512 MiB.
+     */
+    public usize $maxReply = 536870912;
+
+    /**
+     * Options from a URL: `redis://user:password@host:port/db`, `redis://:password@host`, or
+     * `unix:///run/redis.sock?db=2`. User, password and host are percent-decoded. Query keys:
+     * `db`, `username`, `password`, `name` (the client name), `protocol` (`2` or `3`), `timeout`
+     * and `connect_timeout` (`250ms`, `5s`, `2m`), `max_reply`. `rediss://` is refused: this
+     * client has no TLS yet.
+     */
+    public static function parse(const string& $url) : result<Options, Error>
+    {
+        Options $o = Options();
+        string $rest = '';
+        bool $unix = false;
+        if ($url->starts('redis://')) {
+            $rest = $url->sub(8, $url->size() - 8);
+        } else if ($url->starts('unix://')) {
+            $rest = $url->sub(7, $url->size() - 7);
+            $unix = true;
+        } else if ($url->starts('rediss://')) {
+            return .error(.invalid('this client has no TLS yet: rediss:// cannot be met'));
+        } else {
+            return .error(.invalid('a Redis URL starts with redis:// or unix://'));
+        }
+
+        string $query = '';
+        usize $q = $rest->find('?');
+        if ($q < $rest->size()) {
+            $query = $rest->sub($q + 1, $rest->size() - $q - 1);
+            $rest = $rest->sub(0, $q);
+        }
+
+        // the last '@' ends the user info, so an unescaped '@' in the password still works
+        usize $at = lastOf($rest, 64);
+        if ($at < $rest->size()) {
+            string $auth = $rest->sub(0, $at);
+            $rest = $rest->sub($at + 1, $rest->size() - $at - 1);
+            usize $colon = $auth->find(':');
+            string $user = $auth;
+            if ($colon < $auth->size()) {
+                $user = $auth->sub(0, $colon);
+                string $pass = guard unescape($auth->sub($colon + 1, $auth->size() - $colon - 1)) else {
+                    return .error(.invalid('the password is not valid percent-encoding'));
+                }
+                $o->password = $pass;
+            }
+            string $u = guard unescape($user) else {
+                return .error(.invalid('the user is not valid percent-encoding'));
+            }
+            if (!$u->empty()) {
+                $o->username = $u;
+            }
+        }
+
+        if ($unix) {
+            string $path = guard unescape($rest) else {
+                return .error(.invalid('the socket path is not valid percent-encoding'));
+            }
+            if ($path->empty()) {
+                return .error(.invalid('a unix:// URL without a socket path'));
+            }
+            $o->socket = $path;
+        } else {
+            string $db = '';
+            usize $slash = $rest->find('/');
+            if ($slash < $rest->size()) {
+                $db = $rest->sub($slash + 1, $rest->size() - $slash - 1);
+                $rest = $rest->sub(0, $slash);
+            }
+            if (!$db->empty()) {
+                try $o->option('db', $db);
+            }
+            try $o->address($rest);
+        }
+
+        if (!$query->empty()) {
+            foreach (str::split($query, '&')->owned() as $pair) {
+                if ($pair->empty()) {
+                    continue;
+                }
+                usize $eq = $pair->find('=');
+                string $key = $pair;
+                string $raw = '';
+                if ($eq < $pair->size()) {
+                    $key = $pair->sub(0, $eq);
+                    $raw = $pair->sub($eq + 1, $pair->size() - $eq - 1);
+                }
+                string $value = guard unescape($raw) else {
+                    return .error(.invalid("the value of '{$key}' is not valid percent-encoding"));
+                }
+                try $o->option($key, $value);
+            }
+        }
+        return .ok($o);
+    }
+
+    /**
+     * The deadline of a call: the one it names, or `timeout` from now, plus how long a blocking
+     * command may hold its reply back. A block of zero waits forever.
+     */
+    internal const function deadline(tcp::Deadline? $by, time::duration? $block) : tcp::Deadline
+    {
+        tcp::Deadline $given = guard $by else {
+            time::duration $t = guard $this->timeout else {
+                return tcp::Deadline::never();
+            }
+            if ($block != null) {
+                time::duration $b = guard $block;
+                if ($b->as_millis() == 0) {
+                    return tcp::Deadline::never();
+                }
+                return tcp::Deadline(after: $t + $b);
+            }
+            return tcp::Deadline(after: $t);
+        }
+        return $given;
+    }
+
+    /**
+     * The address part of a URL: `host`, `host:port`, `[::1]:port`, or empty for the default.
+     */
+    private function address(const string& $rest) : status<Error>
+    {
+        if ($rest->empty()) {
+            return .ok;
+        }
+        string $host = $rest;
+        if ($rest->starts('[')) {
+            usize $close = $rest->find(']');
+            if ($close == $rest->size()) {
+                return .error(.invalid('an IPv6 host without its closing bracket'));
+            }
+            $host = $rest->sub(1, $close - 1);
+            string $after = $rest->sub($close + 1, $rest->size() - $close - 1);
+            if (!$after->empty()) {
+                if (!$after->starts(':')) {
+                    return .error(.invalid("'{$after}' after the host"));
+                }
+                uint16 $p6 = try port($after->sub(1, $after->size() - 1));
+                $this->port = $p6;
+            }
+        } else {
+            usize $colon = $rest->find(':');
+            if ($colon < $rest->size()) {
+                $host = $rest->sub(0, $colon);
+                uint16 $p = try port($rest->sub($colon + 1, $rest->size() - $colon - 1));
+                $this->port = $p;
+            }
+        }
+        string $h = guard unescape($host) else {
+            return .error(.invalid('the host is not valid percent-encoding'));
+        }
+        if (!$h->empty()) {
+            $this->host = $h;
+        }
+        return .ok;
+    }
+
+    /**
+     * Set one option by its URL name.
+     */
+    private function option(const string& $key, const string& $value) : status<Error>
+    {
+        if ($key == 'db') {
+            uint64 $n = guard str::uint($value) else {
+                return .error(.invalid("the database is a number, not '{$value}'"));
+            }
+            if ($n > 4294967295) {
+                return .error(.invalid("database {$n} is out of range"));
+            }
+            $this->database = $n as uint32;
+            return .ok;
+        }
+        if ($key == 'username' || $key == 'user') {
+            $this->username = $value;
+            return .ok;
+        }
+        if ($key == 'password') {
+            $this->password = $value;
+            return .ok;
+        }
+        if ($key == 'name' || $key == 'client_name') {
+            $this->clientName = $value;
+            return .ok;
+        }
+        if ($key == 'protocol') {
+            if ($value == '2') {
+                $this->protocol = Protocol::resp2;
+            } else if ($value == '3') {
+                $this->protocol = Protocol::resp3;
+            } else {
+                return .error(.invalid("protocol is 2 or 3, not '{$value}'"));
+            }
+            return .ok;
+        }
+        if ($key == 'timeout') {
+            time::duration $t = guard duration($value) else {
+                return .error(.invalid("timeout '{$value}' is not a duration like 500ms or 5s"));
+            }
+            $this->timeout = $t;
+            return .ok;
+        }
+        if ($key == 'connect_timeout') {
+            time::duration $c = guard duration($value) else {
+                return .error(.invalid("connect_timeout '{$value}' is not a duration like 500ms or 5s"));
+            }
+            $this->connectTimeout = $c;
+            return .ok;
+        }
+        if ($key == 'max_reply') {
+            uint64 $m = guard str::uint($value) else {
+                return .error(.invalid("max_reply is a number, not '{$value}'"));
+            }
+            if ($m < 1024) {
+                return .error(.invalid("max_reply {$m} is under the 1024 bytes a login needs"));
+            }
+            $this->maxReply = $m as usize;
+            return .ok;
+        }
+        return .error(.invalid("unknown option '{$key}'"));
+    }
+}
+
+/**
+ * Where the last byte `$b` is in `$s`, or the size when there is none.
+ */
+internal function lastOf(const string& $s, uint8 $b) : usize
+{
+    usize $i = $s->size();
+    while ($i > 0) {
+        $i = $i - 1;
+        if ($s->byte($i) == $b) {
+            return $i;
+        }
+    }
+    return $s->size();
+}
+
+/**
+ * `%XX` escapes decoded, or null when one is broken.
+ */
+internal function unescape(const string& $s) : string?
+{
+    string $out = '';
+    usize $i = 0;
+    while ($i < $s->size()) {
+        uint8 $c = $s->byte($i);
+        if ($c != 37) {
+            $out->push($c);
+            $i = $i + 1;
+            continue;
+        }
+        if ($i + 2 >= $s->size()) {
+            return null;
+        }
+        uint8 $hi = guard nibble($s->byte($i + 1)) else {
+            return null;
+        }
+        uint8 $lo = guard nibble($s->byte($i + 2)) else {
+            return null;
+        }
+        $out->push($hi * 16 + $lo);
+        $i = $i + 3;
+    }
+    return $out;
+}
+
+/**
+ * The value of the hex digit `$c`, either case, or null when it is not one.
+ */
+internal function nibble(uint8 $c) : uint8?
+{
+    uint8? $v = null;
+    if ($c >= 48 && $c <= 57) {
+        $v = $c - 48;
+    } else if ($c >= 97 && $c <= 102) {
+        $v = $c - 87;
+    } else if ($c >= 65 && $c <= 70) {
+        $v = $c - 55;
+    }
+    return $v;
+}
+
+internal function port(const string& $text) : result<uint16, Error>
+{
+    uint64 $n = guard str::uint($text) else {
+        return .error(.invalid("port '{$text}' is not a number"));
+    }
+    if ($n == 0 || $n > 65535) {
+        return .error(.invalid("port {$n} is not 1..65535"));
+    }
+    return .ok($n as uint16);
+}
+
+/**
+ * `250ms`, `5s` or `2m`, or a bare number of seconds.
+ */
+internal function duration(const string& $text) : time::duration?
+{
+    string $digits = $text;
+    int64 $scale = 1000;
+    if ($text->ends('ms')) {
+        $digits = $text->sub(0, $text->size() - 2);
+        $scale = 1;
+    } else if ($text->ends('s')) {
+        $digits = $text->sub(0, $text->size() - 1);
+    } else if ($text->ends('m')) {
+        $digits = $text->sub(0, $text->size() - 1);
+        $scale = 60000;
+    }
+    int64 $n = guard str::int($digits) else {
+        return null;
+    }
+    // too long to count in milliseconds: refused rather than wrapped round
+    if ($n < 0 || $n > 9223372036854775807 / $scale) {
+        return null;
+    }
+    return time::duration::millis($n * $scale);
+}

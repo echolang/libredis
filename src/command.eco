@@ -1,0 +1,398 @@
+namespace redis;
+
+use std::time;
+
+// the slot of a command that names no key
+internal const int32 NO_SLOT = -1;
+
+// the slot of a command whose keys hash to different slots
+internal const int32 CROSS_SLOT = -2;
+
+/**
+ * What a command does to the connection it runs on, beyond its reply.
+ */
+internal enum Session
+{
+    /**
+     * Nothing: the next command finds the connection as this one left it.
+     */
+    case plain;
+
+    /**
+     * It changes state that outlives it: the database, a transaction, watched keys, client
+     * settings, the login. A pool puts such a connection back with `reset` before lending it again.
+     */
+    case alters;
+
+    /**
+     * It turns the connection into a listener whose replies answer no later command.
+     */
+    case listens;
+}
+
+/**
+ * One command, encoded as it goes on the wire while it is built: a RESP array of bulk strings.
+ * Every typed command builds one; `call` takes one for anything else.
+ *
+ * ```echo
+ * redis::Command $c = redis::Command(['OBJECT', 'ENCODING', 'k']);
+ *
+ * redis::Command $set = redis::Command('SET');
+ * $set->key('k')->arg('v')->arg('PX')->arg(1500);
+ * ```
+ *
+ * `key` adds an argument that is a key, so a cluster knows where to send the command. The array
+ * form and `arg` do not mark keys; a cluster looks those up in the server's command table.
+ */
+public struct Command
+{
+    // the arguments as RESP bulk strings, without the array header
+    private string $body = '';
+    private uint32 $count = 0;
+    private int32 $slot = NO_SLOT;
+    // how long the server may hold the reply back, in milliseconds: -1 not at all, 0 forever
+    private int64 $blockMs = -1;
+    private Session $session = Session::plain;
+
+    /**
+     * A command with its name only. Add the arguments with `key` and `arg`.
+     */
+    public constructor(string::view $name)
+    {
+        $this->session = sessionOf($name);
+        $this->arg($name);
+    }
+
+    /**
+     * A command from its name and arguments, none of them marked as a key.
+     */
+    public constructor(const array<string>& $args)
+    {
+        if (!$args->empty()) {
+            $this->session = sessionOf($args[0]);
+        }
+        foreach ($args as const &$a) {
+            $this->arg($a);
+        }
+    }
+
+    /**
+     * Add an argument: any bytes.
+     */
+    public function arg(string::view $value) : Command&
+    {
+        $this->body->reserve($this->body->size() + $value->size + 24);
+        $this->body->push(36);
+        digits($this->body, $value->size as uint64);
+        $this->body->push(13);
+        $this->body->push(10);
+        $this->body->append($value->data(), $value->size);
+        $this->body->push(13);
+        $this->body->push(10);
+        $this->count++;
+        return $this;
+    }
+
+    /**
+     * Add an integer argument, in decimal.
+     */
+    public function arg(int64 $n) : Command&
+    {
+        string $text = str::from($n);
+        return $this->arg($text);
+    }
+
+    /**
+     * Add a float argument, written so the server reads back the same double: `inf`, `-inf`, or
+     * up to 17 significant digits.
+     */
+    public function arg(float64 $x) : Command&
+    {
+        string $text = floatArg($x);
+        return $this->arg($text);
+    }
+
+    /**
+     * Add every one of `$values`.
+     */
+    public function args(const array<string>& $values) : Command&
+    {
+        foreach ($values as const &$v) {
+            $this->arg($v);
+        }
+        return $this;
+    }
+
+    /**
+     * Add an argument that names a key.
+     */
+    public function key(string::view $key) : Command&
+    {
+        int32 $s = hashSlot($key) as int32;
+        if ($this->slot == NO_SLOT) {
+            $this->slot = $s;
+        } else if ($this->slot != $s) {
+            $this->slot = CROSS_SLOT;
+        }
+        return $this->arg($key);
+    }
+
+    /**
+     * Add every one of `$keys`, each as a key.
+     */
+    public function keys(const array<string>& $keys) : Command&
+    {
+        foreach ($keys as const &$k) {
+            $this->key($k);
+        }
+        return $this;
+    }
+
+    /**
+     * Mark the command as one the server answers only after up to `$timeout` (`BLPOP`, `XREAD
+     * BLOCK`, `WAIT`), zero for as long as it takes. A call without a deadline of its own then
+     * waits that long on top of `Options->timeout`.
+     */
+    public function blocking(time::duration $timeout) : Command&
+    {
+        $this->blockMs = blockMillis($timeout);
+        return $this;
+    }
+
+    /**
+     * A blocking timeout in seconds as the next argument (`BLPOP` and the like), with the command
+     * marked as blocking that long: the argument and the deadline never disagree.
+     */
+    internal function timeoutArg(time::duration $timeout) : Command&
+    {
+        $this->blocking($timeout);
+        return $this->arg(($this->blockMs as float64) / 1000.0);
+    }
+
+    /**
+     * `BLOCK` and its milliseconds (`XREAD` and the like), with the command marked as blocking
+     * that long.
+     */
+    internal function blockArg(time::duration $block) : Command&
+    {
+        $this->blocking($block);
+        $this->arg('BLOCK');
+        return $this->arg($this->blockMs);
+    }
+
+    /**
+     * How long the server may hold the reply back: null for a command that does not block, zero
+     * for one that may block forever.
+     */
+    public const function blocks() : time::duration?
+    {
+        if ($this->blockMs < 0) {
+            return null;
+        }
+        return time::duration::millis($this->blockMs);
+    }
+
+    /**
+     * What the command does to the connection it runs on.
+     */
+    internal const function session() : Session
+    {
+        return $this->session;
+    }
+
+    /**
+     * Mark a session command as one a pool need not `reset` after: it only reads
+     * (`CLIENT ID`), or the connection keeps track of what it changes itself (`select`,
+     * `watch`) and undoes just that.
+     */
+    internal function plain() : Command&
+    {
+        $this->session = Session::plain;
+        return $this;
+    }
+
+    /**
+     * How many arguments, the name included.
+     */
+    public const function count() : uint32
+    {
+        return $this->count;
+    }
+
+    /**
+     * The cluster slot of the keys named with `key`. Null when there are none, or when they hash
+     * to different slots (`crossSlot()`).
+     */
+    public const function slot() : uint16?
+    {
+        if ($this->slot < 0) {
+            return null;
+        }
+        return $this->slot as uint16;
+    }
+
+    /**
+     * True when the keys named with `key` hash to more than one cluster slot.
+     */
+    public const function crossSlot() : bool
+    {
+        return $this->slot == CROSS_SLOT;
+    }
+
+    /**
+     * True when at least one argument was added with `key`.
+     */
+    public const function keyed() : bool
+    {
+        return $this->slot != NO_SLOT;
+    }
+
+    /**
+     * The command's name in capitals: `GET`, `CLIENT`.
+     */
+    public const function name() : string
+    {
+        if ($this->count == 0) {
+            return '';
+        }
+        usize $at = 0;
+        usize $size = headerSize($this->body, $at);
+        return str::upper(string($this->body->view()->sub($at, $size)));
+    }
+
+    /**
+     * The arguments back as strings, the name first.
+     */
+    public const function args() : array<string>
+    {
+        array<string> $out = arr::room<string>($this->count as usize);
+        usize $at = 0;
+        while ($at < $this->body->size()) {
+            usize $size = headerSize($this->body, $at);
+            $out->push(string($this->body->view()->sub($at, $size)));
+            $at = $at + $size + 2;
+        }
+        return $out;
+    }
+
+    /**
+     * The whole command as it goes on the wire.
+     */
+    public const function wire() : string
+    {
+        string $out = '';
+        $this->into($out);
+        return $out;
+    }
+
+    /**
+     * The array header: `*3\r\n`.
+     */
+    internal const function head() : string
+    {
+        string $h = '';
+        $this->header($h);
+        return $h;
+    }
+
+    private const function header(string& $out) : void
+    {
+        $out->push(42);
+        digits($out, $this->count as uint64);
+        $out->push(13);
+        $out->push(10);
+    }
+
+    /**
+     * The arguments as they go on the wire, after `head()`.
+     */
+    internal const function body() : const string&
+    {
+        return $this->body;
+    }
+
+    /**
+     * Append the whole command onto `$out`, for a batch that leaves in one write.
+     */
+    internal const function into(string& $out) : void
+    {
+        $this->header($out);
+        $out->append($this->body);
+    }
+}
+
+/**
+ * A blocking command's timeout in whole milliseconds, as the server and the deadline read it:
+ * zero only for zero (wait forever), and anything shorter than a millisecond rounded up to one,
+ * so a tiny wait never turns into an endless one. Negative counts as zero.
+ */
+internal function blockMillis(time::duration $timeout) : int64
+{
+    int64 $ns = $timeout->as_nanos();
+    if ($ns <= 0) {
+        return 0;
+    }
+    int64 $ms = $timeout->as_millis();
+    if ($ms == 0) {
+        return 1;
+    }
+    return $ms;
+}
+
+/**
+ * What the command named `$name` does to its connection. Compared without regard to case; the
+ * length is looked at first, so the common commands cost a comparison or two.
+ */
+internal function sessionOf(string::view $name) : Session
+{
+    usize $n = $name->size;
+    if ($n < 4 || $n > 10) {
+        return Session::plain;
+    }
+    if (str::iequals($name, 'SUBSCRIBE') || str::iequals($name, 'PSUBSCRIBE') || str::iequals($name, 'SSUBSCRIBE') || str::iequals($name, 'MONITOR')) {
+        return Session::listens;
+    }
+    if (str::iequals($name, 'SELECT') || str::iequals($name, 'MULTI') || str::iequals($name, 'WATCH') || str::iequals($name, 'CLIENT') || str::iequals($name, 'HELLO') || str::iequals($name, 'AUTH') || str::iequals($name, 'READONLY') || str::iequals($name, 'READWRITE')) {
+        return Session::alters;
+    }
+    return Session::plain;
+}
+
+/**
+ * `$n` in decimal onto `$out`, without a string in between.
+ */
+internal function digits(string& $out, uint64 $n) : void
+{
+    if ($n < 10) {
+        $out->push(($n + 48) as uint8);
+        return;
+    }
+    fixed_array<uint8, 20> $buf = fixed_array<uint8, 20>();
+    usize $len = 0;
+    uint64 $v = $n;
+    while ($v > 0) {
+        $buf[$len] = (($v % 10) + 48) as uint8;
+        $v = $v / 10;
+        $len++;
+    }
+    while ($len > 0) {
+        $len--;
+        $out->push($buf[$len]);
+    }
+}
+
+/**
+ * The size a `$N\r\n` header at `$at` announces, with `$at` moved past the header. Only for bodies
+ * `Command` wrote.
+ */
+internal function headerSize(const string& $body, usize& $at) : usize
+{
+    usize $n = 0;
+    usize $i = $at + 1;
+    while ($body->byte($i) != 13) {
+        $n = $n * 10 + ($body->byte($i) - 48) as usize;
+        $i = $i + 1;
+    }
+    $at = $i + 2;
+    return $n;
+}

@@ -1,0 +1,205 @@
+/**
+ * The reply layer: commands out, replies in, over one TCP or unix stream. A reply already
+ * buffered whole is decoded in one pass, straight from the read buffer; one that is not yet is
+ * scanned as it arrives, then decoded once. RESP3 pushes that arrive between replies are handed
+ * to `onPush` and never taken for a reply. Any failure leaves the channel broken: a partly read
+ * reply leaves no way back to the next one's start.
+ */
+
+namespace redis;
+
+internal class Channel
+{
+    private tcp::Stream $stream;
+    private tcp::Reader $reader;
+    private usize $maxReply;
+    private bool $broken;
+    private redis::resp::Scanner $scanner;
+    // the scanner is part way through the reply at the front of the buffer
+    private bool $scanning;
+
+    /**
+     * Who hears the pushes that arrive between replies: client tracking invalidations, or
+     * messages for a connection that subscribed. Null drops them.
+     */
+    internal function<void(Reply)>? $onPush;
+
+    /**
+     * Hand pushes over like replies, for a subscriber, whose messages are its replies.
+     */
+    internal bool $passPushes;
+
+    internal constructor(tcp::Stream $stream, usize $maxReply)
+    {
+        $this->stream = $stream;
+        $this->reader = tcp::Reader(max: $maxReply);
+        $this->maxReply = $maxReply;
+        $this->broken = false;
+        $this->scanner = redis::resp::Scanner();
+        $this->scanning = false;
+        $this->onPush = null;
+        $this->passPushes = false;
+    }
+
+    internal const function alive() : bool
+    {
+        return !$this->broken && !$this->stream->closed();
+    }
+
+    /**
+     * Send one command: its header and its arguments in one gathered write, neither copied.
+     */
+    internal function send(const Command& $c, tcp::Deadline $by) : status<Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        string $head = $c->head();
+        guard $this->stream->write($head, $c->body(), $by) else ($e) {
+            return .error($this->fail($e));
+        }
+        return .ok;
+    }
+
+    /**
+     * Send commands already encoded back to back, in one write.
+     */
+    internal function write(const string& $bytes, tcp::Deadline $by) : status<Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        guard $this->stream->write($bytes, $by) else ($e) {
+            return .error($this->fail($e));
+        }
+        return .ok;
+    }
+
+    /**
+     * The next reply. Pushes on the way go to `onPush`, unless `passPushes` asks for them here.
+     */
+    internal function next(tcp::Deadline $by) : result<Reply, Error>
+    {
+        while (true) {
+            Reply? $got = try $this->read($by, true);
+            Reply $r = guard $got else {
+                return .error(.timeout);
+            }
+            if (!$this->passPushes && isPush($r)) {
+                function<void(Reply)>? $hook = $this->onPush;
+                if ($hook != null) {
+                    function<void(Reply)> $h = guard $hook;
+                    $h($r);
+                }
+                continue;
+            }
+            return .ok($r);
+        }
+    }
+
+    /**
+     * The next reply or push, when one comes before the deadline; null when none did. Nothing is
+     * owed here (a subscriber waits for messages that may never come), so the deadline passing
+     * leaves the connection as it was, part of a reply that did arrive included.
+     */
+    internal function wait(tcp::Deadline $by) : result<Reply?, Error>
+    {
+        return $this->read($by, false);
+    }
+
+    /**
+     * The next reply, whatever its kind. When the deadline passes first: with `$owed`, the
+     * reply would answer the next command, so the connection closes and that is `.timeout`;
+     * without, null.
+     */
+    private function read(tcp::Deadline $by, bool $owed) : result<Reply?, Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        while (true) {
+            usize $have = $this->reader->buffered();
+            usize $want = 1;
+            if ($have > 0) {
+                string::view $bytes = $this->reader->window($have);
+                if (!$this->scanning) {
+                    // most replies are here whole: build it in one pass
+                    redis::resp::Decoder $d = redis::resp::Decoder($bytes);
+                    Reply $r = guard $d->reply($this->scanner) else ($e) {
+                        $this->close();
+                        return .error($e);
+                    }
+                    if (!$d->short) {
+                        $this->reader->skip($d->at);
+                        return .ok($r);
+                    }
+                    // walked again with the size limit, which the first pass does not apply
+                    $this->scanning = true;
+                    $this->scanner->reset();
+                }
+                bool $whole = guard $this->scanner->step($bytes, $this->maxReply) else ($e) {
+                    $this->close();
+                    return .error($e);
+                }
+                if ($whole) {
+                    usize $size = $this->scanner->at;
+                    $this->scanning = false;
+                    redis::resp::Decoder $all = redis::resp::Decoder($this->reader->window($size));
+                    Reply $done = guard $all->framed($size) else ($e) {
+                        $this->close();
+                        return .error($e);
+                    }
+                    if ($all->short || $all->at != $size) {
+                        $this->close();
+                        return .error(.malformed('a reply whose end could not be agreed on'));
+                    }
+                    $this->reader->skip($size);
+                    return .ok($done);
+                }
+                $want = $this->scanner->want;
+            }
+            bool $there = guard $this->reader->ensure($this->stream, $want, $by) else ($e) {
+                return .error($this->fail($e));
+            }
+            if (!$there) {
+                if (!$owed) {
+                    return .ok(null);
+                }
+                // the reply is still owed and would answer the next command: no way on
+                $this->close();
+                return .error(.timeout);
+            }
+        }
+    }
+
+    internal function close() : void
+    {
+        $this->broken = true;
+        $this->stream->close();
+    }
+
+    /**
+     * A socket failure as this library's error. The stream is closed: whatever was half sent or
+     * half read cannot be resynchronised.
+     */
+    private function fail(tcp::Error $e) : Error
+    {
+        $this->close();
+        match ($e) {
+            tcp::Error::tooLarge($n) => {
+                return .tooLarge($n);
+            },
+            else => {
+                return transportError($e);
+            },
+        }
+    }
+}
+
+internal function isPush(const Reply& $r) : bool
+{
+    return match ($r) {
+        Reply::push($p) => true,
+        else => false,
+    };
+}

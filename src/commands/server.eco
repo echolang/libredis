@@ -1,0 +1,300 @@
+/**
+ * The typed commands for the server and the connection: ping, info, flushing, publishing: how each is written (`ServerCommands`), and the methods that
+ * run them on connections, pools and clusters (`Server`) or queue them on pipelines and
+ * transactions (`QueuedServer`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct ServerCommands
+{
+    internal static function ping() : Command
+    {
+        Command $c = Command('PING');
+        return $c;
+    }
+
+    internal static function dbSize() : Command
+    {
+        Command $c = Command('DBSIZE');
+        return $c;
+    }
+
+    internal static function flushDb(bool $async) : Command
+    {
+        Command $c = Command('FLUSHDB');
+        if ($async) {
+            $c->arg('ASYNC');
+        }
+        return $c;
+    }
+
+    internal static function flushAll(bool $async) : Command
+    {
+        Command $c = Command('FLUSHALL');
+        if ($async) {
+            $c->arg('ASYNC');
+        }
+        return $c;
+    }
+
+    internal static function info(string? $section) : Command
+    {
+        Command $c = Command('INFO');
+        if ($section != null) {
+            string $s = guard $section;
+            $c->arg($s);
+        }
+        return $c;
+    }
+
+    internal static function time() : Command
+    {
+        Command $c = Command('TIME');
+        return $c;
+    }
+
+    internal static function clientSetName(const string& $name) : Command
+    {
+        Command $c = Command('CLIENT');
+        $c->arg('SETNAME');
+        $c->arg($name);
+        return $c;
+    }
+
+    internal static function clientGetName() : Command
+    {
+        Command $c = Command('CLIENT');
+        $c->plain();
+        $c->arg('GETNAME');
+        return $c;
+    }
+
+    internal static function clientId() : Command
+    {
+        Command $c = Command('CLIENT');
+        $c->plain();
+        $c->arg('ID');
+        return $c;
+    }
+
+    internal static function publish(const string& $channel, const string& $message) : Command
+    {
+        Command $c = Command('PUBLISH');
+        $c->arg($channel);
+        $c->arg($message);
+        return $c;
+    }
+
+    internal static function sPublish(const string& $channel, const string& $message) : Command
+    {
+        Command $c = Command('SPUBLISH');
+        $c->key($channel);
+        $c->arg($message);
+        return $c;
+    }
+}
+
+/**
+ * The commands for the server and the connection: ping, info, flushing, publishing, each run as it is called and answered with its reply.
+ */
+public interface Server
+{
+    /**
+     * Ask the server to answer.
+     */
+    function ping(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ServerCommands::ping(), by: $by);
+        return .ok;
+    }
+
+    /**
+     * How many keys the database holds.
+     */
+    function dbSize(by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::dbSize(), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Delete every key of the database. `$async` frees the memory in the background.
+     */
+    function flushDb(async: bool $async = false, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ServerCommands::flushDb($async), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Delete every key of every database. `$async` frees the memory in the background.
+     */
+    function flushAll(async: bool $async = false, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ServerCommands::flushAll($async), by: $by);
+        return .ok;
+    }
+
+    /**
+     * The server's `INFO` text, of `$section` only when set.
+     */
+    function info(string? $section = null, by: tcp::Deadline? $by = null) : result<string, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::info($section), by: $by);
+        return Decode::bytes($r);
+    }
+
+    /**
+     * The server's clock, in microseconds since the Unix epoch.
+     */
+    function time(by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::time(), by: $by);
+        return Decode::micros($r);
+    }
+
+    /**
+     * Name the connection, for `CLIENT LIST`.
+     */
+    function clientSetName(const string& $name, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ServerCommands::clientSetName($name), by: $by);
+        return .ok;
+    }
+
+    /**
+     * The connection's name, or null.
+     */
+    function clientGetName(by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::clientGetName(), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * The connection's id on the server.
+     */
+    function clientId(by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::clientId(), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Send `$message` to the subscribers of `$channel`, and answer how many got it.
+     */
+    function publish(const string& $channel, const string& $message, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::publish($channel, $message), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Send `$message` to the subscribers of the shard channel `$channel` (Redis 7), and answer how
+     * many got it.
+     */
+    function sPublish(const string& $channel, const string& $message, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ServerCommands::sPublish($channel, $message), by: $by);
+        return Decode::int($r);
+    }
+}
+
+/**
+ * The commands for the server and the connection: ping, info, flushing, publishing, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedServer
+{
+    /**
+     * Ask the server to answer.
+     */
+    function ping() : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ServerCommands::ping()), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * How many keys the database holds.
+     */
+    function dbSize() : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ServerCommands::dbSize()), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Delete every key of the database. `$async` frees the memory in the background.
+     */
+    function flushDb(async: bool $async = false) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ServerCommands::flushDb($async)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Delete every key of every database. `$async` frees the memory in the background.
+     */
+    function flushAll(async: bool $async = false) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ServerCommands::flushAll($async)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * The server's `INFO` text, of `$section` only when set.
+     */
+    function info(string? $section = null) : Deferred<string>
+    {
+        return Deferred<string>($this->queue(ServerCommands::info($section)), (const Reply& $r) => Decode::bytes($r));
+    }
+
+    /**
+     * The server's clock, in microseconds since the Unix epoch.
+     */
+    function time() : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ServerCommands::time()), (const Reply& $r) => Decode::micros($r));
+    }
+
+    /**
+     * Name the connection, for `CLIENT LIST`.
+     */
+    function clientSetName(const string& $name) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ServerCommands::clientSetName($name)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * The connection's name, or null.
+     */
+    function clientGetName() : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(ServerCommands::clientGetName()), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * The connection's id on the server.
+     */
+    function clientId() : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ServerCommands::clientId()), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Send `$message` to the subscribers of `$channel`, and answer how many got it.
+     */
+    function publish(const string& $channel, const string& $message) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ServerCommands::publish($channel, $message)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Send `$message` to the subscribers of the shard channel `$channel` (Redis 7), and answer how
+     * many got it.
+     */
+    function sPublish(const string& $channel, const string& $message) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ServerCommands::sPublish($channel, $message)), (const Reply& $r) => Decode::int($r));
+    }
+}

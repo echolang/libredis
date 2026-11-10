@@ -1,0 +1,361 @@
+/**
+ * RESP2 and RESP3 replies, read from bytes already buffered. `Decoder` builds a `Reply` in one
+ * pass and says when the bytes end before the reply does (`short`); `Scanner` then waits for the
+ * rest without building anything, picking up where it stopped, so a long reply that comes in
+ * many reads is walked once, not once per read.
+ */
+
+namespace redis::resp;
+
+/**
+ * How deep replies may nest. Redis's own replies nest a handful of levels; this is for garbage.
+ */
+internal const usize MAX_DEPTH = 64;
+
+// the fewest bytes one element of an aggregate takes: `_\r\n`
+internal const usize MIN_ELEMENT = 3;
+
+/**
+ * Builds one reply from the front of `$bytes`. When they end first, `short` is set and the reply
+ * is to be read again once more bytes are in; that is not an error.
+ *
+ * The strings of an aggregate share one copy of its bytes: one allocation for the whole reply
+ * instead of one per element. A string short enough to be held inline is copied on its own.
+ */
+internal struct Decoder
+{
+    internal string::view $bytes;
+
+    /**
+     * Where the next reply starts; after `reply()`, where the one read ended.
+     */
+    internal usize $at = 0;
+
+    /**
+     * The bytes ended before the reply did.
+     */
+    internal bool $short = false;
+
+    // the copy of an aggregate's bytes its strings point into, while one is being read
+    private string $owner = '';
+    private bool $shared = false;
+
+    internal function reply() : result<redis::Reply, redis::Error>
+    {
+        return $this->reply(Scanner());
+    }
+
+    /**
+     * `reply()` with a scanner the caller keeps, rather than a new one for every aggregate.
+     */
+    internal function reply(Scanner $scan) : result<redis::Reply, redis::Error>
+    {
+        if ($this->at >= $this->bytes->size || !aggregate($this->bytes->byte($this->at))) {
+            return $this->value(0);
+        }
+        // find where the aggregate ends, copy it once, and read it from the copy
+        $scan->reset();
+        string::view $rest = $this->bytes->sub($this->at, $this->bytes->size - $this->at);
+        bool $whole = try $scan->step($rest, 18446744073709551615);
+        if (!$whole) {
+            $this->short = true;
+            return .ok(redis::Reply::nil);
+        }
+        return $this->framed($scan->at);
+    }
+
+    /**
+     * The reply at `at`, already known to take `$size` bytes: copied once and read from the copy.
+     */
+    internal function framed(usize $size) : result<redis::Reply, redis::Error>
+    {
+        usize $base = $this->at;
+        string::view $outer = $this->bytes;
+        $this->owner = string($this->bytes->sub($this->at, $size));
+        $this->bytes = $this->owner->view();
+        $this->at = 0;
+        $this->shared = true;
+        result<redis::Reply, redis::Error> $r = $this->value(0);
+        $this->shared = false;
+        $this->bytes = $outer;
+        $this->at = $base + $this->at;
+        return $r;
+    }
+
+    /**
+     * The `$size` bytes from `$from` as a string of their own: a window on the shared copy when
+     * there is one and they are too long to hold inline, a copy otherwise.
+     */
+    private const function piece(usize $from, usize $size) : string
+    {
+        if ($this->shared && $size > string::INLINE) {
+            return $this->owner->sub($from, $size);
+        }
+        return string($this->bytes->sub($from, $size));
+    }
+
+    private function value(usize $depth) : result<redis::Reply, redis::Error>
+    {
+        if ($depth > MAX_DEPTH) {
+            return .error(.malformed("replies nested over {$depth} deep"));
+        }
+        // attributes in front of the reply are skipped in this loop, so a long chain of them
+        // costs no stack
+        while (true) {
+            usize $size = $this->bytes->size;
+            if ($this->at >= $size) {
+                return $this->more();
+            }
+            uint8 $type = $this->bytes->byte($this->at);
+            usize $start = $this->at + 1;
+            usize $cr = lineEnd($this->bytes, $start);
+            if ($cr + 1 >= $size) {
+                return $this->more();
+            }
+            if ($this->bytes->byte($cr + 1) != 10) {
+                return .error(.malformed('a line that does not end in CRLF'));
+            }
+            string::view $line = $this->bytes->sub($start, $cr - $start);
+            $this->at = $cr + 2;
+
+            if ($type == 36) {
+                // $: a bulk string
+                int64 $len = guard redis::parseInt($line) else {
+                    return .error(.malformed('a bulk string length that is not a number'));
+                }
+                if ($len == -1) {
+                    return .ok(redis::Reply::nil);
+                }
+                usize $from = $this->at;
+                string::view $data = try $this->blob($len);
+                if ($this->short) {
+                    return .ok(redis::Reply::nil);
+                }
+                return .ok(redis::Reply::bulk($this->piece($from, $data->size)));
+            }
+            if ($type == 42 || $type == 126 || $type == 62) {
+                // *, ~ and >: an array, a set, a push
+                int64 $n = guard redis::parseInt($line) else {
+                    return .error(.malformed('an aggregate length that is not a number'));
+                }
+                if ($n == -1 && $type == 42) {
+                    return .ok(redis::Reply::nil);
+                }
+                array<redis::Reply> $items = try $this->elements($n, $depth);
+                if ($this->short) {
+                    return .ok(redis::Reply::nil);
+                }
+                if ($type == 42) {
+                    return .ok(redis::Reply::array(mv $items));
+                }
+                if ($type == 126) {
+                    return .ok(redis::Reply::set(mv $items));
+                }
+                return .ok(redis::Reply::push(mv $items));
+            }
+            if ($type == 43) {
+                return .ok(redis::Reply::simple($this->piece($start, $line->size)));
+            }
+            if ($type == 58) {
+                int64 $v = guard redis::parseInt($line) else {
+                    return .error(.malformed('an integer reply that is not one'));
+                }
+                return .ok(redis::Reply::int($v));
+            }
+            if ($type == 45) {
+                return .ok(redis::Reply::error(redis::ServerError(line: $line)));
+            }
+            if ($type == 95) {
+                if ($line->size != 0) {
+                    return .error(.malformed('a null with something after it'));
+                }
+                return .ok(redis::Reply::nil);
+            }
+            if ($type == 37) {
+                // %: a map
+                int64 $pairs = guard redis::parseInt($line) else {
+                    return .error(.malformed('a map length that is not a number'));
+                }
+                if ($pairs < 0 || $pairs > 4611686018427387903) {
+                    return .error(.malformed("a map of {$pairs} entries"));
+                }
+                usize $count = $pairs as usize;
+                // a count the bytes left cannot hold: not here yet, or garbage the scanner will refuse
+                if ($count * 2 > ($this->bytes->size - $this->at) / MIN_ELEMENT) {
+                    $this->short = true;
+                    return .ok(redis::Reply::nil);
+                }
+                array<redis::Pair> $entries = arr::room<redis::Pair>($count);
+                usize $i = 0;
+                while ($i < $count) {
+                    redis::Reply $k = try $this->value($depth + 1);
+                    if ($this->short) {
+                        return .ok(redis::Reply::nil);
+                    }
+                    redis::Reply $v = try $this->value($depth + 1);
+                    if ($this->short) {
+                        return .ok(redis::Reply::nil);
+                    }
+                    $entries->push(redis::Pair(mv $k, mv $v));
+                    $i++;
+                }
+                return .ok(redis::Reply::map(mv $entries));
+            }
+            if ($type == 44) {
+                float64 $x = guard redis::parseFloat($line) else {
+                    return .error(.malformed('a double that is not one'));
+                }
+                return .ok(redis::Reply::double($x));
+            }
+            if ($type == 35) {
+                if ($line->size == 1 && $line->byte(0) == 116) {
+                    return .ok(redis::Reply::bool(true));
+                }
+                if ($line->size == 1 && $line->byte(0) == 102) {
+                    return .ok(redis::Reply::bool(false));
+                }
+                return .error(.malformed('a boolean that is neither t nor f'));
+            }
+            if ($type == 33 || $type == 61) {
+                // ! and =: a bulk error, a verbatim string
+                int64 $blen = guard redis::parseInt($line) else {
+                    return .error(.malformed('a bulk length that is not a number'));
+                }
+                string::view $body = try $this->blob($blen);
+                if ($this->short) {
+                    return .ok(redis::Reply::nil);
+                }
+                if ($type == 33) {
+                    return .ok(redis::Reply::error(redis::ServerError(line: $body)));
+                }
+                if ($body->size < 4 || $body->byte(3) != 58) {
+                    return .error(.malformed('a verbatim string without its format'));
+                }
+                return .ok(redis::Reply::verbatim(string($body->sub(0, 3)), string($body->sub(4, $body->size - 4))));
+            }
+            if ($type == 40) {
+                if (!bigDigits($line)) {
+                    return .error(.malformed('a big number that is not one'));
+                }
+                return .ok(redis::Reply::big(string($line)));
+            }
+            if ($type == 124) {
+                // |: attributes, which annotate the reply after them; nothing here reads them
+                int64 $attrs = guard redis::parseInt($line) else {
+                    return .error(.malformed('an attribute count that is not a number'));
+                }
+                if ($attrs < 0 || $attrs > 4611686018427387903) {
+                    return .error(.malformed("{$attrs} attributes"));
+                }
+                try $this->elements($attrs * 2, $depth);
+                if ($this->short) {
+                    return .ok(redis::Reply::nil);
+                }
+                continue;
+            }
+            return .error(.malformed("unknown type byte {$type}"));
+        }
+    }
+
+    /**
+     * `$n` replies in a row, one level down.
+     */
+    private function elements(int64 $n, usize $depth) : result<array<redis::Reply>, redis::Error>
+    {
+        if ($n < 0) {
+            return .error(.malformed("an aggregate of {$n} elements"));
+        }
+        usize $count = $n as usize;
+        // a count the bytes left cannot hold: not here yet, or garbage the scanner will refuse
+        if ($count > ($this->bytes->size - $this->at) / MIN_ELEMENT) {
+            $this->short = true;
+            return .ok(array<redis::Reply>());
+        }
+        array<redis::Reply> $items = arr::room<redis::Reply>($count);
+        usize $i = 0;
+        while ($i < $count) {
+            redis::Reply $r = try $this->value($depth + 1);
+            if ($this->short) {
+                return .ok($items);
+            }
+            $items->push(mv $r);
+            $i = $i + 1;
+        }
+        return .ok($items);
+    }
+
+    /**
+     * The `$len` bytes of a bulk payload and the CRLF after them.
+     */
+    private function blob(int64 $len) : result<string::view, redis::Error>
+    {
+        if ($len < 0) {
+            return .error(.malformed("a bulk length of {$len}"));
+        }
+        usize $n = $len as usize;
+        // $at never passes the size: it only moves past bytes that are there
+        if ($this->bytes->size - $this->at < $n + 2) {
+            $this->short = true;
+            return .ok($this->bytes->sub(0, 0));
+        }
+        usize $end = $this->at + $n;
+        if ($this->bytes->byte($end) != 13 || $this->bytes->byte($end + 1) != 10) {
+            return .error(.malformed('a bulk string that does not end in CRLF'));
+        }
+        string::view $data = $this->bytes->sub($this->at, $n);
+        $this->at = $end + 2;
+        return .ok($data);
+    }
+
+    private function more() : result<redis::Reply, redis::Error>
+    {
+        $this->short = true;
+        return .ok(redis::Reply::nil);
+    }
+}
+
+/**
+ * True for the type bytes of replies that hold others: `*`, `%`, `~`, `>`, and `|` before one.
+ */
+internal function aggregate(uint8 $type) : bool
+{
+    return $type == 42 || $type == 37 || $type == 126 || $type == 62 || $type == 124;
+}
+
+/**
+ * Where the CR ending the line from `$from` is, or the size when it has not arrived.
+ */
+internal function lineEnd(string::view $bytes, usize $from) : usize
+{
+    usize $i = $from;
+    usize $size = $bytes->size;
+    while ($i < $size) {
+        if ($bytes->byte($i) == 13) {
+            return $i;
+        }
+        $i = $i + 1;
+    }
+    return $size;
+}
+
+/**
+ * True for an optional minus and at least one digit.
+ */
+internal function bigDigits(string::view $line) : bool
+{
+    usize $i = 0;
+    if ($line->size > 0 && $line->byte(0) == 45) {
+        $i = 1;
+    }
+    if ($i >= $line->size) {
+        return false;
+    }
+    while ($i < $line->size) {
+        uint8 $c = $line->byte($i);
+        if ($c < 48 || $c > 57) {
+            return false;
+        }
+        $i = $i + 1;
+    }
+    return true;
+}

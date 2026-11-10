@@ -1,0 +1,635 @@
+/**
+ * The typed commands for string values, counters, HyperLogLogs and bits: how each is written (`StringCommands`), and the methods that
+ * run them on connections, pools and clusters (`Strings`) or queue them on pipelines and
+ * transactions (`QueuedStrings`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct StringCommands
+{
+    internal static function get(const string& $key) : Command
+    {
+        Command $c = Command('GET');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function set(const string& $key, const string& $value, SetOptions $options) : Command
+    {
+        Command $c = Command('SET');
+        $c->key($key);
+        $c->arg($value);
+        $options->into($c);
+        return $c;
+    }
+
+    internal static function setTtl(const string& $key, const string& $value, time::duration $ttl) : Command
+    {
+        Command $c = Command('SET');
+        $c->key($key);
+        $c->arg($value);
+        Expiry(after: $ttl)->into($c);
+        return $c;
+    }
+
+    internal static function setGet(const string& $key, const string& $value, SetOptions $options) : Command
+    {
+        Command $c = StringCommands::set($key, $value, $options);
+        $c->arg('GET');
+        return $c;
+    }
+
+    internal static function getDel(const string& $key) : Command
+    {
+        Command $c = Command('GETDEL');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function getEx(const string& $key, const Expiry& $expiry) : Command
+    {
+        Command $c = Command('GETEX');
+        $c->key($key);
+        $expiry->into($c);
+        return $c;
+    }
+
+    internal static function mGet(const array<string>& $keys) : Command
+    {
+        Command $c = Command('MGET');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function mSet(const ordered_map<string, string>& $values) : Command
+    {
+        return StringCommands::keyed('MSET', $values);
+    }
+
+    internal static function mSetNx(const ordered_map<string, string>& $values) : Command
+    {
+        return StringCommands::keyed('MSETNX', $values);
+    }
+
+    /**
+     * Each key then its value.
+     */
+    private static function keyed(string::view $name, const ordered_map<string, string>& $values) : Command
+    {
+        Command $c = Command($name);
+        foreach ($values as $k => const &$v) {
+            $c->key($k)->arg($v);
+        }
+        return $c;
+    }
+
+    internal static function incr(const string& $key) : Command
+    {
+        Command $c = Command('INCR');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function incrBy(const string& $key, int64 $amount) : Command
+    {
+        Command $c = Command('INCRBY');
+        $c->key($key);
+        $c->arg($amount);
+        return $c;
+    }
+
+    internal static function incrByFloat(const string& $key, float64 $amount) : Command
+    {
+        Command $c = Command('INCRBYFLOAT');
+        $c->key($key);
+        $c->arg($amount);
+        return $c;
+    }
+
+    internal static function decr(const string& $key) : Command
+    {
+        Command $c = Command('DECR');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function decrBy(const string& $key, int64 $amount) : Command
+    {
+        Command $c = Command('DECRBY');
+        $c->key($key);
+        $c->arg($amount);
+        return $c;
+    }
+
+    internal static function append(const string& $key, const string& $value) : Command
+    {
+        Command $c = Command('APPEND');
+        $c->key($key);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function strLen(const string& $key) : Command
+    {
+        Command $c = Command('STRLEN');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function getRange(const string& $key, int64 $start, int64 $end) : Command
+    {
+        Command $c = Command('GETRANGE');
+        $c->key($key);
+        $c->arg($start);
+        $c->arg($end);
+        return $c;
+    }
+
+    internal static function setRange(const string& $key, int64 $offset, const string& $value) : Command
+    {
+        Command $c = Command('SETRANGE');
+        $c->key($key);
+        $c->arg($offset);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function pfAdd(const string& $key, const array<string>& $elements) : Command
+    {
+        Command $c = Command('PFADD');
+        $c->key($key);
+        $c->args($elements);
+        return $c;
+    }
+
+    internal static function pfCount(const array<string>& $keys) : Command
+    {
+        Command $c = Command('PFCOUNT');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function pfMerge(const string& $destination, const array<string>& $keys) : Command
+    {
+        Command $c = Command('PFMERGE');
+        $c->key($destination);
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function setBit(const string& $key, int64 $offset, bool $value) : Command
+    {
+        Command $c = Command('SETBIT');
+        $c->key($key);
+        $c->arg($offset);
+        if ($value) {
+            $c->arg('1');
+        } else {
+            $c->arg('0');
+        }
+        return $c;
+    }
+
+    internal static function getBit(const string& $key, int64 $offset) : Command
+    {
+        Command $c = Command('GETBIT');
+        $c->key($key);
+        $c->arg($offset);
+        return $c;
+    }
+
+    internal static function bitCount(const string& $key) : Command
+    {
+        Command $c = Command('BITCOUNT');
+        $c->key($key);
+        return $c;
+    }
+}
+
+/**
+ * The commands for string values, counters, HyperLogLogs and bits, each run as it is called and answered with its reply.
+ */
+public interface Strings
+{
+    /**
+     * The value of `$key`, or null when there is none.
+     */
+    function get(const string& $key, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(StringCommands::get($key), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Set `$key` to `$value`. False when the options' condition (`nx`, `xx`) stopped it.
+     */
+    function set(const string& $key, const string& $value, SetOptions $options = SetOptions(), by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StringCommands::set($key, $value, $options), by: $by);
+        return Decode::written($r);
+    }
+
+    /**
+     * Set `$key` to `$value`, expiring after `$ttl`.
+     */
+    function set(const string& $key, const string& $value, ttl: time::duration $ttl, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StringCommands::setTtl($key, $value, $ttl), by: $by);
+        return Decode::written($r);
+    }
+
+    /**
+     * Set `$key` to `$value` and answer the value it had, or null.
+     */
+    function setGet(const string& $key, const string& $value, SetOptions $options = SetOptions(), by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(StringCommands::setGet($key, $value, $options), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * The value of `$key`, deleting the key. Null when there was none.
+     */
+    function getDel(const string& $key, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(StringCommands::getDel($key), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * The value of `$key`, giving it a new expiry (or none, with `Expiry::persist()`).
+     */
+    function getEx(const string& $key, const Expiry& $expiry, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(StringCommands::getEx($key, $expiry), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * The values of `$keys`, in order, null for each that has none.
+     */
+    function mGet(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<array<string?>, Error>
+    {
+        Reply $r = try $this->call(StringCommands::mGet($keys), by: $by);
+        return Decode::maybeTexts($r);
+    }
+
+    /**
+     * Set every key of `$values` to its value, all at once.
+     */
+    function mSet(const ordered_map<string, string>& $values, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(StringCommands::mSet($values), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Set every key of `$values` to its value, all at once, only when none of them exists. True
+     * when it did.
+     */
+    function mSetNx(const ordered_map<string, string>& $values, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StringCommands::mSetNx($values), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * Add 1 to the integer at `$key` (0 when there is none), and answer the new value.
+     */
+    function incr(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::incr($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Add `$amount` to the integer at `$key`, and answer the new value.
+     */
+    function incrBy(const string& $key, int64 $amount, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::incrBy($key, $amount), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Add `$amount` to the number at `$key`, and answer the new value.
+     */
+    function incrByFloat(const string& $key, float64 $amount, by: tcp::Deadline? $by = null) : result<float64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::incrByFloat($key, $amount), by: $by);
+        return Decode::float($r);
+    }
+
+    /**
+     * Take 1 from the integer at `$key`, and answer the new value.
+     */
+    function decr(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::decr($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Take `$amount` from the integer at `$key`, and answer the new value.
+     */
+    function decrBy(const string& $key, int64 $amount, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::decrBy($key, $amount), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Append `$value` to the string at `$key`, and answer its new length.
+     */
+    function append(const string& $key, const string& $value, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::append($key, $value), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The length of the string at `$key`, 0 when there is none.
+     */
+    function strLen(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::strLen($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The bytes of the string at `$key` from `$start` to `$end`, both included; negative counts
+     * from the end.
+     */
+    function getRange(const string& $key, int64 $start, int64 $end, by: tcp::Deadline? $by = null) : result<string, Error>
+    {
+        Reply $r = try $this->call(StringCommands::getRange($key, $start, $end), by: $by);
+        return Decode::bytes($r);
+    }
+
+    /**
+     * Overwrite the string at `$key` from `$offset` with `$value`, and answer its new length.
+     */
+    function setRange(const string& $key, int64 $offset, const string& $value, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::setRange($key, $offset, $value), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Add `$elements` to the HyperLogLog at `$key`. True when its estimate changed.
+     */
+    function pfAdd(const string& $key, const array<string>& $elements, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StringCommands::pfAdd($key, $elements), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * The estimated number of distinct elements in the HyperLogLogs at `$keys`, together.
+     */
+    function pfCount(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::pfCount($keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Merge the HyperLogLogs at `$keys` into the one at `$destination`.
+     */
+    function pfMerge(const string& $destination, const array<string>& $keys, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(StringCommands::pfMerge($destination, $keys), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Set the bit at `$offset` of the string at `$key`, and answer what it was.
+     */
+    function setBit(const string& $key, int64 $offset, bool $value, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StringCommands::setBit($key, $offset, $value), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * The bit at `$offset` of the string at `$key`.
+     */
+    function getBit(const string& $key, int64 $offset, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StringCommands::getBit($key, $offset), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * How many bits are set in the string at `$key`.
+     */
+    function bitCount(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StringCommands::bitCount($key), by: $by);
+        return Decode::int($r);
+    }
+}
+
+/**
+ * The commands for string values, counters, HyperLogLogs and bits, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedStrings
+{
+    /**
+     * The value of `$key`, or null when there is none.
+     */
+    function get(const string& $key) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(StringCommands::get($key)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Set `$key` to `$value`. False when the options' condition (`nx`, `xx`) stopped it.
+     */
+    function set(const string& $key, const string& $value, SetOptions $options = SetOptions()) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::set($key, $value, $options)), (const Reply& $r) => Decode::written($r));
+    }
+
+    /**
+     * Set `$key` to `$value`, expiring after `$ttl`.
+     */
+    function set(const string& $key, const string& $value, ttl: time::duration $ttl) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::setTtl($key, $value, $ttl)), (const Reply& $r) => Decode::written($r));
+    }
+
+    /**
+     * Set `$key` to `$value` and answer the value it had, or null.
+     */
+    function setGet(const string& $key, const string& $value, SetOptions $options = SetOptions()) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(StringCommands::setGet($key, $value, $options)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * The value of `$key`, deleting the key. Null when there was none.
+     */
+    function getDel(const string& $key) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(StringCommands::getDel($key)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * The value of `$key`, giving it a new expiry (or none, with `Expiry::persist()`).
+     */
+    function getEx(const string& $key, const Expiry& $expiry) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(StringCommands::getEx($key, $expiry)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * The values of `$keys`, in order, null for each that has none.
+     */
+    function mGet(const array<string>& $keys) : Deferred<array<string?>>
+    {
+        return Deferred<array<string?>>($this->queue(StringCommands::mGet($keys)), (const Reply& $r) => Decode::maybeTexts($r));
+    }
+
+    /**
+     * Set every key of `$values` to its value, all at once.
+     */
+    function mSet(const ordered_map<string, string>& $values) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::mSet($values)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Set every key of `$values` to its value, all at once, only when none of them exists. True
+     * when it did.
+     */
+    function mSetNx(const ordered_map<string, string>& $values) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::mSetNx($values)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * Add 1 to the integer at `$key` (0 when there is none), and answer the new value.
+     */
+    function incr(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::incr($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Add `$amount` to the integer at `$key`, and answer the new value.
+     */
+    function incrBy(const string& $key, int64 $amount) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::incrBy($key, $amount)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Add `$amount` to the number at `$key`, and answer the new value.
+     */
+    function incrByFloat(const string& $key, float64 $amount) : Deferred<float64>
+    {
+        return Deferred<float64>($this->queue(StringCommands::incrByFloat($key, $amount)), (const Reply& $r) => Decode::float($r));
+    }
+
+    /**
+     * Take 1 from the integer at `$key`, and answer the new value.
+     */
+    function decr(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::decr($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Take `$amount` from the integer at `$key`, and answer the new value.
+     */
+    function decrBy(const string& $key, int64 $amount) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::decrBy($key, $amount)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Append `$value` to the string at `$key`, and answer its new length.
+     */
+    function append(const string& $key, const string& $value) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::append($key, $value)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The length of the string at `$key`, 0 when there is none.
+     */
+    function strLen(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::strLen($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The bytes of the string at `$key` from `$start` to `$end`, both included; negative counts
+     * from the end.
+     */
+    function getRange(const string& $key, int64 $start, int64 $end) : Deferred<string>
+    {
+        return Deferred<string>($this->queue(StringCommands::getRange($key, $start, $end)), (const Reply& $r) => Decode::bytes($r));
+    }
+
+    /**
+     * Overwrite the string at `$key` from `$offset` with `$value`, and answer its new length.
+     */
+    function setRange(const string& $key, int64 $offset, const string& $value) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::setRange($key, $offset, $value)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Add `$elements` to the HyperLogLog at `$key`. True when its estimate changed.
+     */
+    function pfAdd(const string& $key, const array<string>& $elements) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::pfAdd($key, $elements)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * The estimated number of distinct elements in the HyperLogLogs at `$keys`, together.
+     */
+    function pfCount(const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::pfCount($keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Merge the HyperLogLogs at `$keys` into the one at `$destination`.
+     */
+    function pfMerge(const string& $destination, const array<string>& $keys) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::pfMerge($destination, $keys)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Set the bit at `$offset` of the string at `$key`, and answer what it was.
+     */
+    function setBit(const string& $key, int64 $offset, bool $value) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::setBit($key, $offset, $value)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * The bit at `$offset` of the string at `$key`.
+     */
+    function getBit(const string& $key, int64 $offset) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StringCommands::getBit($key, $offset)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * How many bits are set in the string at `$key`.
+     */
+    function bitCount(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StringCommands::bitCount($key)), (const Reply& $r) => Decode::int($r));
+    }
+}

@@ -1,0 +1,288 @@
+/**
+ * Scripted Redis servers for the offline tests. `fake` serves one client on a thread of its own,
+ * command by command as the test's script says. `FakeNode` serves any number of clients, each on
+ * a thread, from one answering function: enough of a cluster node.
+ */
+
+use std::thread;
+use std::time;
+
+/**
+ * The server's side of one connection.
+ */
+internal class Wire
+{
+    internal tcp::Stream $s;
+    internal tcp::Reader $r;
+
+    internal constructor(tcp::Stream $s)
+    {
+        $this->s = $s;
+        $this->r = tcp::Reader(max: 1073741824);
+    }
+
+    /**
+     * The next command, its arguments joined by spaces, or null once the client has gone or
+     * `$ms` passed.
+     */
+    internal function tryRecv(int64 $ms) : array<string>?
+    {
+        array<string>? $none = null;
+        tcp::Deadline $by = tcp::Deadline(ms: $ms);
+        string? $head = guard $this->r->until($this->s, "\r\n", $by) else {
+            return $none;
+        }
+        string $h = guard $head else {
+            return $none;
+        }
+        if (!$h->starts('*')) {
+            die("fake: a command that is no array: '{$h}'");
+        }
+        uint64 $n = str::uint($h->sub(1, $h->size() - 1)) ?? 0;
+        array<string> $args = array<string>();
+        uint64 $i = 0;
+        while ($i < $n) {
+            string? $lenLine = guard $this->r->until($this->s, "\r\n", $by) else {
+                return $none;
+            }
+            string $l = guard $lenLine else {
+                return $none;
+            }
+            uint64 $len = str::uint($l->sub(1, $l->size() - 1)) ?? 0;
+            string? $data = guard $this->r->exactly($this->s, ($len + 2) as usize, $by) else {
+                return $none;
+            }
+            string $d = guard $data else {
+                return $none;
+            }
+            $args->push($d->sub(0, $len as usize));
+            $i++;
+        }
+        array<string>? $got = $args;
+        return $got;
+    }
+
+    /**
+     * The next command, as one line. Dies after 5 seconds without one.
+     */
+    internal function recv() : string
+    {
+        array<string> $args = guard $this->tryRecv(5000) else {
+            die('fake recv: the client went away');
+        }
+        return str::join($args, ' ');
+    }
+
+    /**
+     * The next command has to be `$line`.
+     */
+    internal function expect(const string& $line) : void
+    {
+        string $got = $this->recv();
+        if ($got != $line) {
+            die("fake: expected '{$line}', got '{$got}'");
+        }
+    }
+
+    /**
+     * Answer with raw RESP.
+     */
+    internal function send(const string& $bytes) : void
+    {
+        guard $this->s->write($bytes, tcp::Deadline(ms: 5000)) else ($e) {
+            die("fake send: {$e}");
+        }
+    }
+
+    /**
+     * Answer a byte or a few at a time, so the client reads the reply in many pieces.
+     */
+    internal function trickle(const string& $bytes, usize $piece) : void
+    {
+        usize $at = 0;
+        while ($at < $bytes->size()) {
+            usize $n = $piece;
+            if ($at + $n > $bytes->size()) {
+                $n = $bytes->size() - $at;
+            }
+            $this->send($bytes->sub($at, $n));
+            time::sleep(time::duration::micros(200));
+            $at = $at + $n;
+        }
+    }
+
+    /**
+     * Expect a HELLO and answer it as Redis 7.2 does, in RESP3.
+     */
+    internal function welcome() : void
+    {
+        string $hello = $this->recv();
+        if (!$hello->starts('HELLO')) {
+            die("fake: expected HELLO, got '{$hello}'");
+        }
+        $this->send(helloMap(7));
+    }
+
+    internal function close() : void
+    {
+        $this->s->close();
+    }
+}
+
+/**
+ * HELLO's answer: a RESP3 map, as Redis 7.2 sends it.
+ */
+internal function helloMap(int64 $id) : string
+{
+    return "%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$5\r\n7.2.4\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:{$id}\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n";
+}
+
+internal struct Fake
+{
+    internal tcp::Address $at;
+    internal thread::handle $server;
+}
+
+internal function fake(function<void(Wire)> $script) : Fake
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+        die("listen: {$e}");
+    }
+    return serveOn($l, $script);
+}
+
+internal function fakeUnix(const string& $path, function<void(Wire)> $script) : Fake
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: $path)) else ($e) {
+        die("listen: {$e}");
+    }
+    return serveOn($l, $script);
+}
+
+internal function serveOn(tcp::Listener $l, function<void(Wire)> $script) : Fake
+{
+    thread::handle $h = guard thread::spawn(function() : void {
+        tcp::Stream? $maybe = guard $l->accept(tcp::Deadline(ms: 5000)) else ($e) {
+            die("accept: {$e}");
+        }
+        tcp::Stream $s = guard $maybe else {
+            die('no client came');
+        }
+        $script(Wire($s));
+        $s->finish(tcp::Deadline(ms: 1000));
+        $l->close();
+    }) else ($e) {
+        die($e->message());
+    }
+    return Fake($l->local, $h);
+}
+
+internal function optionsFor(const Fake& $f) : redis::Options
+{
+    redis::Options $o = redis::Options();
+    $o->host = '127.0.0.1';
+    $o->port = $f->at->port;
+    $o->connectTimeout = time::duration::secs(5);
+    return $o;
+}
+
+internal function login(const redis::Options& $o) : redis::Connection
+{
+    redis::Connection $r = guard redis::Connection::open($o) else ($e) {
+        die("connect: {$e}");
+    }
+    return $r;
+}
+
+internal function login(const Fake& $f) : redis::Connection
+{
+    return login(optionsFor($f));
+}
+
+/**
+ * A counter several threads bump.
+ */
+#[atomic]
+internal class Tally
+{
+    internal atomic<int64> $n;
+
+    internal constructor()
+    {
+        $this->n = atomic<int64>(0);
+    }
+
+    internal function bump() : int64
+    {
+        int64 $before = $this->n->add(1);
+        return $before + 1;
+    }
+
+    internal function get() : int64
+    {
+        return $this->n->load();
+    }
+}
+
+/**
+ * A server for any number of clients, each served on a thread of its own: every command goes to
+ * `$answer`, whose raw RESP goes back. An empty answer closes that connection.
+ */
+#[atomic]
+internal class FakeNode
+{
+    internal tcp::Listener $l;
+    internal uint16 $port;
+
+    internal constructor(function<string(array<string>)> $answer)
+    {
+        tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+            die("listen: {$e}");
+        }
+        $this->l = $l;
+        $this->port = $l->local->port;
+        thread::handle $accepting = guard thread::spawn(function() : void {
+            while (true) {
+                tcp::Stream? $maybe = guard $l->accept(tcp::Deadline(ms: 100)) else {
+                    return;
+                }
+                tcp::Stream $s = guard $maybe else {
+                    continue;
+                }
+                thread::handle $serving = guard thread::spawn(function() : void {
+                    Wire $w = Wire($s);
+                    while (true) {
+                        array<string> $args = guard $w->tryRecv(10000) else {
+                            $s->close();
+                            return;
+                        }
+                        string $out = $answer($args);
+                        if ($out->empty()) {
+                            $s->close();
+                            return;
+                        }
+                        guard $s->write($out, tcp::Deadline(ms: 5000)) else {
+                            return;
+                        }
+                    }
+                }) else ($e) {
+                    die($e->message());
+                }
+                $serving->detach();
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+        $accepting->detach();
+    }
+
+    internal function address() : string
+    {
+        return "127.0.0.1:{$this->port}";
+    }
+
+    internal function stop() : void
+    {
+        $this->l->close();
+    }
+}

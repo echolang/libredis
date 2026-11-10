@@ -1,0 +1,593 @@
+/**
+ * The typed commands for sorted sets: members ordered by a score: how each is written (`SortedSetCommands`), and the methods that
+ * run them on connections, pools and clusters (`SortedSets`) or queue them on pipelines and
+ * transactions (`QueuedSortedSets`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct SortedSetCommands
+{
+    internal static function zAdd(const string& $key, const array<Scored>& $members, ZAddOptions $options) : Command
+    {
+        Command $c = Command('ZADD');
+        $c->key($key);
+        $options->into($c);
+        foreach ($members as const &$m) {
+            $c->arg($m->score)->arg($m->member);
+        }
+        return $c;
+    }
+
+    internal static function zRem(const string& $key, const array<string>& $members) : Command
+    {
+        Command $c = Command('ZREM');
+        $c->key($key);
+        $c->args($members);
+        return $c;
+    }
+
+    internal static function zScore(const string& $key, const string& $member) : Command
+    {
+        Command $c = Command('ZSCORE');
+        $c->key($key);
+        $c->arg($member);
+        return $c;
+    }
+
+    internal static function zmScore(const string& $key, const array<string>& $members) : Command
+    {
+        Command $c = Command('ZMSCORE');
+        $c->key($key);
+        $c->args($members);
+        return $c;
+    }
+
+    internal static function zIncrBy(const string& $key, float64 $amount, const string& $member) : Command
+    {
+        Command $c = Command('ZINCRBY');
+        $c->key($key);
+        $c->arg($amount);
+        $c->arg($member);
+        return $c;
+    }
+
+    internal static function zRange(const string& $key, const ZRange& $range) : Command
+    {
+        Command $c = Command('ZRANGE');
+        $c->key($key);
+        $range->into($c);
+        return $c;
+    }
+
+    internal static function zRangeWithScores(const string& $key, const ZRange& $range) : Command
+    {
+        Command $c = Command('ZRANGE');
+        $c->key($key);
+        $range->into($c);
+        $c->arg('WITHSCORES');
+        return $c;
+    }
+
+    internal static function zRangeStore(const string& $destination, const string& $source, const ZRange& $range) : Command
+    {
+        Command $c = Command('ZRANGESTORE');
+        $c->key($destination);
+        $c->key($source);
+        $range->into($c);
+        return $c;
+    }
+
+    internal static function zRank(const string& $key, const string& $member) : Command
+    {
+        Command $c = Command('ZRANK');
+        $c->key($key);
+        $c->arg($member);
+        return $c;
+    }
+
+    internal static function zRevRank(const string& $key, const string& $member) : Command
+    {
+        Command $c = Command('ZREVRANK');
+        $c->key($key);
+        $c->arg($member);
+        return $c;
+    }
+
+    internal static function zCard(const string& $key) : Command
+    {
+        Command $c = Command('ZCARD');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function zCount(const string& $key, const Bound& $min, const Bound& $max) : Command
+    {
+        Command $c = Command('ZCOUNT');
+        $c->key($key);
+        $c->arg($min->text);
+        $c->arg($max->text);
+        return $c;
+    }
+
+    internal static function zPopMin(const string& $key) : Command
+    {
+        Command $c = Command('ZPOPMIN');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function zPopMinCount(const string& $key, uint32 $count) : Command
+    {
+        Command $c = Command('ZPOPMIN');
+        $c->key($key);
+        $c->arg($count as int64);
+        return $c;
+    }
+
+    internal static function zPopMax(const string& $key) : Command
+    {
+        Command $c = Command('ZPOPMAX');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function zPopMaxCount(const string& $key, uint32 $count) : Command
+    {
+        Command $c = Command('ZPOPMAX');
+        $c->key($key);
+        $c->arg($count as int64);
+        return $c;
+    }
+
+    internal static function bzPopMin(const array<string>& $keys, time::duration $timeout) : Command
+    {
+        Command $c = Command('BZPOPMIN');
+        $c->keys($keys);
+        $c->timeoutArg($timeout);
+        return $c;
+    }
+
+    internal static function bzPopMax(const array<string>& $keys, time::duration $timeout) : Command
+    {
+        Command $c = Command('BZPOPMAX');
+        $c->keys($keys);
+        $c->timeoutArg($timeout);
+        return $c;
+    }
+
+    internal static function zRemRangeByRank(const string& $key, int64 $start, int64 $stop) : Command
+    {
+        Command $c = Command('ZREMRANGEBYRANK');
+        $c->key($key);
+        $c->arg($start);
+        $c->arg($stop);
+        return $c;
+    }
+
+    internal static function zRemRangeByScore(const string& $key, const Bound& $min, const Bound& $max) : Command
+    {
+        Command $c = Command('ZREMRANGEBYSCORE');
+        $c->key($key);
+        $c->arg($min->text);
+        $c->arg($max->text);
+        return $c;
+    }
+
+    internal static function zRemRangeByLex(const string& $key, const Bound& $min, const Bound& $max) : Command
+    {
+        Command $c = Command('ZREMRANGEBYLEX');
+        $c->key($key);
+        $c->arg($min->text);
+        $c->arg($max->text);
+        return $c;
+    }
+
+    internal static function zScan(const string& $key, const string& $cursor, ScanOptions $options) : Command
+    {
+        Command $c = Command('ZSCAN');
+        $c->key($key);
+        $c->arg($cursor);
+        $options->into($c);
+        return $c;
+    }
+}
+
+/**
+ * The commands for sorted sets: members ordered by a score, each run as it is called and answered with its reply.
+ */
+public interface SortedSets
+{
+    /**
+     * Add `$members` with their scores to the sorted set at `$key`, or update their scores, and
+     * answer how many were new (or changed, with `changed`).
+     */
+    function zAdd(const string& $key, const array<Scored>& $members, ZAddOptions $options = ZAddOptions(), by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zAdd($key, $members, $options), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Remove `$members` from the sorted set at `$key`, and answer how many were there.
+     */
+    function zRem(const string& $key, const array<string>& $members, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRem($key, $members), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The score of `$member`, or null when it is not in the set.
+     */
+    function zScore(const string& $key, const string& $member, by: tcp::Deadline? $by = null) : result<float64?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zScore($key, $member), by: $by);
+        return Decode::floatOrNil($r);
+    }
+
+    /**
+     * The scores of `$members`, in order, null for each not in the set.
+     */
+    function zmScore(const string& $key, const array<string>& $members, by: tcp::Deadline? $by = null) : result<array<float64?>, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zmScore($key, $members), by: $by);
+        return Decode::floats($r);
+    }
+
+    /**
+     * Add `$amount` to the score of `$member` (adding it at 0 first when it is not there), and
+     * answer the new score.
+     */
+    function zIncrBy(const string& $key, float64 $amount, const string& $member, by: tcp::Deadline? $by = null) : result<float64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zIncrBy($key, $amount, $member), by: $by);
+        return Decode::float($r);
+    }
+
+    /**
+     * The members `$range` takes, in its order.
+     */
+    function zRange(const string& $key, const ZRange& $range, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRange($key, $range), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The members `$range` takes, with their scores.
+     */
+    function zRangeWithScores(const string& $key, const ZRange& $range, by: tcp::Deadline? $by = null) : result<array<Scored>, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRangeWithScores($key, $range), by: $by);
+        return Decode::scored($r);
+    }
+
+    /**
+     * Store the members `$range` takes from `$source` as the sorted set at `$destination`, and
+     * answer how many.
+     */
+    function zRangeStore(const string& $destination, const string& $source, const ZRange& $range, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRangeStore($destination, $source, $range), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The rank of `$member`, lowest score first from 0, or null.
+     */
+    function zRank(const string& $key, const string& $member, by: tcp::Deadline? $by = null) : result<int64?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRank($key, $member), by: $by);
+        return Decode::intOrNil($r);
+    }
+
+    /**
+     * The rank of `$member`, highest score first from 0, or null.
+     */
+    function zRevRank(const string& $key, const string& $member, by: tcp::Deadline? $by = null) : result<int64?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRevRank($key, $member), by: $by);
+        return Decode::intOrNil($r);
+    }
+
+    /**
+     * How many members the sorted set at `$key` has.
+     */
+    function zCard(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zCard($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * How many members score between `$min` and `$max`.
+     */
+    function zCount(const string& $key, const Bound& $min, const Bound& $max, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zCount($key, $min, $max), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Take the member with the lowest score, or null when the set is empty.
+     */
+    function zPopMin(const string& $key, by: tcp::Deadline? $by = null) : result<Scored?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zPopMin($key), by: $by);
+        return Decode::scoredOne($r);
+    }
+
+    /**
+     * Take up to `$count` members with the lowest scores.
+     */
+    function zPopMin(const string& $key, count: uint32 $count, by: tcp::Deadline? $by = null) : result<array<Scored>, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zPopMinCount($key, $count), by: $by);
+        return Decode::scored($r);
+    }
+
+    /**
+     * Take the member with the highest score, or null when the set is empty.
+     */
+    function zPopMax(const string& $key, by: tcp::Deadline? $by = null) : result<Scored?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zPopMax($key), by: $by);
+        return Decode::scoredOne($r);
+    }
+
+    /**
+     * Take up to `$count` members with the highest scores.
+     */
+    function zPopMax(const string& $key, count: uint32 $count, by: tcp::Deadline? $by = null) : result<array<Scored>, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zPopMaxCount($key, $count), by: $by);
+        return Decode::scored($r);
+    }
+
+    /**
+     * `zPopMin` on the first of `$keys` that has a member, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function bzPopMin(const array<string>& $keys, time::duration $timeout, by: tcp::Deadline? $by = null) : result<KeyedScore?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::bzPopMin($keys, $timeout), by: $by);
+        return Decode::keyedScore($r);
+    }
+
+    /**
+     * `zPopMax` on the first of `$keys` that has a member, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function bzPopMax(const array<string>& $keys, time::duration $timeout, by: tcp::Deadline? $by = null) : result<KeyedScore?, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::bzPopMax($keys, $timeout), by: $by);
+        return Decode::keyedScore($r);
+    }
+
+    /**
+     * Remove the members ranked `$start` to `$stop`, and answer how many.
+     */
+    function zRemRangeByRank(const string& $key, int64 $start, int64 $stop, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRemRangeByRank($key, $start, $stop), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Remove the members scored `$min` to `$max`, and answer how many.
+     */
+    function zRemRangeByScore(const string& $key, const Bound& $min, const Bound& $max, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRemRangeByScore($key, $min, $max), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Remove the members named `$min` to `$max`, and answer how many.
+     */
+    function zRemRangeByLex(const string& $key, const Bound& $min, const Bound& $max, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zRemRangeByLex($key, $min, $max), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * One page of the sorted set at `$key`, from `$cursor` (`'0'` to start).
+     */
+    function zScan(const string& $key, const string& $cursor, ScanOptions $options = ScanOptions(), by: tcp::Deadline? $by = null) : result<ScoredPage, Error>
+    {
+        Reply $r = try $this->call(SortedSetCommands::zScan($key, $cursor, $options), by: $by);
+        return Decode::scoredScan($r);
+    }
+}
+
+/**
+ * The commands for sorted sets: members ordered by a score, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedSortedSets
+{
+    /**
+     * Add `$members` with their scores to the sorted set at `$key`, or update their scores, and
+     * answer how many were new (or changed, with `changed`).
+     */
+    function zAdd(const string& $key, const array<Scored>& $members, ZAddOptions $options = ZAddOptions()) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zAdd($key, $members, $options)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Remove `$members` from the sorted set at `$key`, and answer how many were there.
+     */
+    function zRem(const string& $key, const array<string>& $members) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zRem($key, $members)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The score of `$member`, or null when it is not in the set.
+     */
+    function zScore(const string& $key, const string& $member) : Deferred<float64?>
+    {
+        return Deferred<float64?>($this->queue(SortedSetCommands::zScore($key, $member)), (const Reply& $r) => Decode::floatOrNil($r));
+    }
+
+    /**
+     * The scores of `$members`, in order, null for each not in the set.
+     */
+    function zmScore(const string& $key, const array<string>& $members) : Deferred<array<float64?>>
+    {
+        return Deferred<array<float64?>>($this->queue(SortedSetCommands::zmScore($key, $members)), (const Reply& $r) => Decode::floats($r));
+    }
+
+    /**
+     * Add `$amount` to the score of `$member` (adding it at 0 first when it is not there), and
+     * answer the new score.
+     */
+    function zIncrBy(const string& $key, float64 $amount, const string& $member) : Deferred<float64>
+    {
+        return Deferred<float64>($this->queue(SortedSetCommands::zIncrBy($key, $amount, $member)), (const Reply& $r) => Decode::float($r));
+    }
+
+    /**
+     * The members `$range` takes, in its order.
+     */
+    function zRange(const string& $key, const ZRange& $range) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SortedSetCommands::zRange($key, $range)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The members `$range` takes, with their scores.
+     */
+    function zRangeWithScores(const string& $key, const ZRange& $range) : Deferred<array<Scored>>
+    {
+        return Deferred<array<Scored>>($this->queue(SortedSetCommands::zRangeWithScores($key, $range)), (const Reply& $r) => Decode::scored($r));
+    }
+
+    /**
+     * Store the members `$range` takes from `$source` as the sorted set at `$destination`, and
+     * answer how many.
+     */
+    function zRangeStore(const string& $destination, const string& $source, const ZRange& $range) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zRangeStore($destination, $source, $range)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The rank of `$member`, lowest score first from 0, or null.
+     */
+    function zRank(const string& $key, const string& $member) : Deferred<int64?>
+    {
+        return Deferred<int64?>($this->queue(SortedSetCommands::zRank($key, $member)), (const Reply& $r) => Decode::intOrNil($r));
+    }
+
+    /**
+     * The rank of `$member`, highest score first from 0, or null.
+     */
+    function zRevRank(const string& $key, const string& $member) : Deferred<int64?>
+    {
+        return Deferred<int64?>($this->queue(SortedSetCommands::zRevRank($key, $member)), (const Reply& $r) => Decode::intOrNil($r));
+    }
+
+    /**
+     * How many members the sorted set at `$key` has.
+     */
+    function zCard(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zCard($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * How many members score between `$min` and `$max`.
+     */
+    function zCount(const string& $key, const Bound& $min, const Bound& $max) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zCount($key, $min, $max)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Take the member with the lowest score, or null when the set is empty.
+     */
+    function zPopMin(const string& $key) : Deferred<Scored?>
+    {
+        return Deferred<Scored?>($this->queue(SortedSetCommands::zPopMin($key)), (const Reply& $r) => Decode::scoredOne($r));
+    }
+
+    /**
+     * Take up to `$count` members with the lowest scores.
+     */
+    function zPopMin(const string& $key, count: uint32 $count) : Deferred<array<Scored>>
+    {
+        return Deferred<array<Scored>>($this->queue(SortedSetCommands::zPopMinCount($key, $count)), (const Reply& $r) => Decode::scored($r));
+    }
+
+    /**
+     * Take the member with the highest score, or null when the set is empty.
+     */
+    function zPopMax(const string& $key) : Deferred<Scored?>
+    {
+        return Deferred<Scored?>($this->queue(SortedSetCommands::zPopMax($key)), (const Reply& $r) => Decode::scoredOne($r));
+    }
+
+    /**
+     * Take up to `$count` members with the highest scores.
+     */
+    function zPopMax(const string& $key, count: uint32 $count) : Deferred<array<Scored>>
+    {
+        return Deferred<array<Scored>>($this->queue(SortedSetCommands::zPopMaxCount($key, $count)), (const Reply& $r) => Decode::scored($r));
+    }
+
+    /**
+     * `zPopMin` on the first of `$keys` that has a member, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function bzPopMin(const array<string>& $keys, time::duration $timeout) : Deferred<KeyedScore?>
+    {
+        return Deferred<KeyedScore?>($this->queue(SortedSetCommands::bzPopMin($keys, $timeout)), (const Reply& $r) => Decode::keyedScore($r));
+    }
+
+    /**
+     * `zPopMax` on the first of `$keys` that has a member, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function bzPopMax(const array<string>& $keys, time::duration $timeout) : Deferred<KeyedScore?>
+    {
+        return Deferred<KeyedScore?>($this->queue(SortedSetCommands::bzPopMax($keys, $timeout)), (const Reply& $r) => Decode::keyedScore($r));
+    }
+
+    /**
+     * Remove the members ranked `$start` to `$stop`, and answer how many.
+     */
+    function zRemRangeByRank(const string& $key, int64 $start, int64 $stop) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zRemRangeByRank($key, $start, $stop)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Remove the members scored `$min` to `$max`, and answer how many.
+     */
+    function zRemRangeByScore(const string& $key, const Bound& $min, const Bound& $max) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zRemRangeByScore($key, $min, $max)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Remove the members named `$min` to `$max`, and answer how many.
+     */
+    function zRemRangeByLex(const string& $key, const Bound& $min, const Bound& $max) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SortedSetCommands::zRemRangeByLex($key, $min, $max)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * One page of the sorted set at `$key`, from `$cursor` (`'0'` to start).
+     */
+    function zScan(const string& $key, const string& $cursor, ScanOptions $options = ScanOptions()) : Deferred<ScoredPage>
+    {
+        return Deferred<ScoredPage>($this->queue(SortedSetCommands::zScan($key, $cursor, $options)), (const Reply& $r) => Decode::scoredScan($r));
+    }
+}

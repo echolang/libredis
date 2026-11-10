@@ -1,0 +1,45 @@
+/**
+ * `must($r->get('k'))`: the value, or the test stops with the error. `fails(...)`: the error a
+ * call had to fail with.
+ */
+
+internal function must<T>(result<T, redis::Error> $r) : T
+{
+    if ($r->failed()) {
+        redis::Error $e = $r->failure();
+        die("{$e}");
+    }
+    return $r->unwrap();
+}
+
+internal function fine(status<redis::Error> $s) : void
+{
+    guard $s else ($e) {
+        die("{$e}");
+    }
+}
+
+internal function fails<T>(result<T, redis::Error> $r) : redis::Error
+{
+    if (!$r->failed()) {
+        die('expected an error');
+    }
+    return $r->failure();
+}
+
+internal function failsStatus(status<redis::Error> $s) : redis::Error
+{
+    if (!$s->failed()) {
+        die('expected an error');
+    }
+    return $s->failure();
+}
+
+/**
+ * The server's major version, from the connection's login.
+ */
+internal function major(const redis::Connection& $r) : int64
+{
+    usize $dot = $r->version->find('.');
+    return str::int($r->version->sub(0, $dot)) ?? 0;
+}

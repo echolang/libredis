@@ -1,0 +1,808 @@
+/**
+ * Every typed command without a server: a `Caller` that writes down what it was sent and answers
+ * from a script. Each command's arguments, word for word, and its reply read the way it would be,
+ * in RESP3 and, where it differs, RESP2.
+ */
+
+use std::time;
+
+internal class Recorder : redis::Caller, redis::Strings, redis::Keys, redis::Hashes, redis::Lists, redis::Sets, redis::SortedSets, redis::Streams, redis::Scripting, redis::Server
+{
+    internal array<string> $sent;
+    internal array<redis::Reply> $answers;
+
+    internal constructor()
+    {
+        $this->sent = array<string>();
+        $this->answers = array<redis::Reply>();
+    }
+
+    public function call(const redis::Command& $command, by: tcp::Deadline? $by = null) : result<redis::Reply, redis::Error>
+    {
+        $this->sent->push(str::join($command->args(), ' '));
+        if ($this->answers->empty()) {
+            return .ok(redis::Reply::simple('OK'));
+        }
+        redis::Reply $r = $this->answers[0];
+        $this->answers->remove(0);
+        return redis::answer(mv $r);
+    }
+
+    /**
+     * Answer the next call with `$r`.
+     */
+    internal function then(redis::Reply $r) : Recorder
+    {
+        $this->answers->push($r);
+        return $this;
+    }
+
+    /**
+     * The last command has to have been `$line`, its arguments joined by spaces.
+     */
+    internal function said(const string& $line) : void
+    {
+        if ($this->sent->empty()) {
+            die("expected '{$line}', nothing was sent");
+        }
+        string $last = $this->sent[$this->sent->count() - 1];
+        if ($last != $line) {
+            die("expected '{$line}', sent '{$last}'");
+        }
+    }
+}
+
+internal function bulk(const string& $s) : redis::Reply
+{
+    return redis::Reply::bulk($s);
+}
+
+internal function int(int64 $n) : redis::Reply
+{
+    return redis::Reply::int($n);
+}
+
+internal function arr(array<redis::Reply> $items) : redis::Reply
+{
+    return redis::Reply::array($items);
+}
+
+internal function bulks(const array<string>& $items) : redis::Reply
+{
+    array<redis::Reply> $out = array<redis::Reply>();
+    foreach ($items as const &$i) {
+        $out->push(redis::Reply::bulk($i));
+    }
+    return redis::Reply::array($out);
+}
+
+test string_commands_send_their_arguments_and_read_their_replies
+{
+    Recorder $r = Recorder();
+    $r->then(bulk('v'));
+    assert((must($r->get('k')) ?? '') == 'v');
+    $r->said('GET k');
+    $r->then(redis::Reply::nil);
+    assert(must($r->get('k')) == null);
+
+    assert(must($r->set('k', 'v')));
+    $r->said('SET k v');
+    redis::SetOptions $o = redis::SetOptions();
+    $o->expiry = redis::Expiry(after: time::duration::secs(2));
+    $o->condition = redis::Condition::nx;
+    $r->then(redis::Reply::nil);
+    assert(!must($r->set('k', 'v', $o)));
+    $r->said('SET k v PX 2000 NX');
+    must($r->set('k', 'v', ttl: time::duration::millis(1500)));
+    $r->said('SET k v PX 1500');
+    redis::SetOptions $keep = redis::SetOptions();
+    $keep->expiry = redis::Expiry::keep();
+    $keep->condition = redis::Condition::xx;
+    $r->then(bulk('old'));
+    assert((must($r->setGet('k', 'v', $keep)) ?? '') == 'old');
+    $r->said('SET k v KEEPTTL XX GET');
+    redis::SetOptions $at = redis::SetOptions();
+    $at->expiry = redis::Expiry(atUnixMillis: 1700000000000);
+    must($r->set('k', 'v', $at));
+    $r->said('SET k v PXAT 1700000000000');
+
+    $r->then(bulk('v'));
+    must($r->getDel('k'));
+    $r->said('GETDEL k');
+    $r->then(bulk('v'));
+    must($r->getEx('k', redis::Expiry::persist()));
+    $r->said('GETEX k PERSIST');
+    $r->then(arr([bulk('a'), redis::Reply::nil]));
+    array<string?> $m = must($r->mGet(['a', 'b']));
+    assert(($m[0] ?? '') == 'a' && $m[1] == null);
+    $r->said('MGET a b');
+    fine($r->mSet(['a' => '1', 'b' => '2']));
+    $r->said('MSET a 1 b 2');
+    $r->then(int(1));
+    assert(must($r->mSetNx(['a' => '1'])));
+    $r->said('MSETNX a 1');
+
+    $r->then(int(1));
+    assert(must($r->incr('n')) == 1);
+    $r->said('INCR n');
+    $r->then(int(5));
+    must($r->incrBy('n', -4));
+    $r->said('INCRBY n -4');
+    $r->then(bulk('1.5'));
+    assert(must($r->incrByFloat('n', 0.5)) == 1.5);
+    $r->said('INCRBYFLOAT n 0.5');
+    $r->then(int(0));
+    must($r->decr('n'));
+    $r->said('DECR n');
+    $r->then(int(0));
+    must($r->decrBy('n', 3));
+    $r->said('DECRBY n 3');
+    $r->then(int(3));
+    assert(must($r->append('k', 'abc')) == 3);
+    $r->said('APPEND k abc');
+    $r->then(int(3));
+    must($r->strLen('k'));
+    $r->said('STRLEN k');
+    $r->then(bulk('ab'));
+    assert(must($r->getRange('k', 0, -2)) == 'ab');
+    $r->said('GETRANGE k 0 -2');
+    $r->then(int(9));
+    must($r->setRange('k', 6, 'xyz'));
+    $r->said('SETRANGE k 6 xyz');
+    $r->then(int(1));
+    assert(must($r->pfAdd('h', ['a', 'b'])));
+    $r->said('PFADD h a b');
+    $r->then(int(2));
+    must($r->pfCount(['h', 'h2']));
+    $r->said('PFCOUNT h h2');
+    fine($r->pfMerge('d', ['h', 'h2']));
+    $r->said('PFMERGE d h h2');
+    $r->then(int(0));
+    assert(!must($r->setBit('b', 7, true)));
+    $r->said('SETBIT b 7 1');
+    $r->then(int(0));
+    must($r->setBit('b', 7, false));
+    $r->said('SETBIT b 7 0');
+    $r->then(int(1));
+    assert(must($r->getBit('b', 7)));
+    $r->said('GETBIT b 7');
+    $r->then(int(1));
+    must($r->bitCount('b'));
+    $r->said('BITCOUNT b');
+}
+
+test key_commands_send_their_arguments_and_read_their_replies
+{
+    Recorder $r = Recorder();
+    $r->then(int(2));
+    assert(must($r->del(['a', 'b'])) == 2);
+    $r->said('DEL a b');
+    $r->then(int(1));
+    must($r->unlink(['a']));
+    $r->said('UNLINK a');
+    $r->then(int(1));
+    must($r->exists(['a', 'a']));
+    $r->said('EXISTS a a');
+    $r->then(int(1));
+    assert(must($r->expire('k', time::duration::secs(10))));
+    $r->said('PEXPIRE k 10000');
+    $r->then(int(0));
+    assert(!must($r->expire('k', time::duration::secs(10), redis::Condition::lt)));
+    $r->said('PEXPIRE k 10000 LT');
+    $r->then(int(1));
+    must($r->expireAt('k', 1700000000000, redis::Condition::nx));
+    $r->said('PEXPIREAT k 1700000000000 NX');
+    $r->then(int(-1));
+    assert(must($r->ttl('k')) == -1);
+    $r->said('TTL k');
+    $r->then(int(-2));
+    must($r->pttl('k'));
+    $r->said('PTTL k');
+    $r->then(int(1));
+    must($r->persist('k'));
+    $r->said('PERSIST k');
+    $r->then(redis::Reply::simple('zset'));
+    assert(must($r->type('k')) == 'zset');
+    $r->said('TYPE k');
+    fine($r->rename('a', 'b'));
+    $r->said('RENAME a b');
+    $r->then(int(0));
+    assert(!must($r->renameNx('a', 'b')));
+    $r->said('RENAMENX a b');
+    $r->then(int(1));
+    must($r->copy('a', 'b'));
+    $r->said('COPY a b');
+    $r->then(int(1));
+    must($r->copy('a', 'b', replace: true));
+    $r->said('COPY a b REPLACE');
+    $r->then(int(1));
+    must($r->touch(['a']));
+    $r->said('TOUCH a');
+    $r->then(redis::Reply::nil);
+    assert(must($r->randomKey()) == null);
+    $r->said('RANDOMKEY');
+    $r->then(bulks(['a', 'b']));
+    assert(must($r->keys('*'))->count() == 2);
+    $r->said('KEYS *');
+    redis::ScanOptions $o = redis::ScanOptions();
+    $o->pattern = 'user:*';
+    $o->count = 100;
+    $o->type = 'hash';
+    $r->then(arr([bulk('17'), bulks(['user:1'])]));
+    redis::ScanPage $p = must($r->scan('0', $o));
+    assert($p->cursor == '17' && !$p->done() && $p->items[0] == 'user:1');
+    $r->said('SCAN 0 MATCH user:* COUNT 100 TYPE hash');
+}
+
+test hash_commands_send_their_arguments_and_read_both_map_shapes
+{
+    Recorder $r = Recorder();
+    $r->then(bulk('v'));
+    must($r->hGet('h', 'f'));
+    $r->said('HGET h f');
+    $r->then(int(2));
+    must($r->hSet('h', ['a' => '1', 'b' => '2']));
+    $r->said('HSET h a 1 b 2');
+    $r->then(int(1));
+    must($r->hSetNx('h', 'f', 'v'));
+    $r->said('HSETNX h f v');
+    $r->then(arr([bulk('1'), redis::Reply::nil]));
+    must($r->hmGet('h', ['a', 'z']));
+    $r->said('HMGET h a z');
+
+    array<redis::Pair> $pairs = [redis::Pair(bulk('a'), bulk('1')), redis::Pair(bulk('b'), bulk('2'))];
+    $r->then(redis::Reply::map($pairs));
+    ordered_map<string, string> $three = must($r->hGetAll('h'));
+    assert($three->count() == 2 && $three['b'] == '2');
+    $r->said('HGETALL h');
+    $r->then(bulks(['a', '1', 'b', '2']));
+    ordered_map<string, string> $two = must($r->hGetAll('h'));
+    assert($two->count() == 2 && $two['a'] == '1');
+    $r->then(bulks(['a', '1', 'b']));
+    assert(fails($r->hGetAll('h'))->name() == 'unexpected');
+    $r->then(int(3));
+    assert(fails($r->hGetAll('h'))->name() == 'unexpected');
+
+    $r->then(int(1));
+    must($r->hDel('h', ['a']));
+    $r->said('HDEL h a');
+    $r->then(redis::Reply::bool(true));
+    assert(must($r->hExists('h', 'a')));
+    $r->said('HEXISTS h a');
+    $r->then(int(3));
+    must($r->hIncrBy('h', 'n', 2));
+    $r->said('HINCRBY h n 2');
+    $r->then(bulk('2.5'));
+    assert(must($r->hIncrByFloat('h', 'n', 0.5)) == 2.5);
+    $r->said('HINCRBYFLOAT h n 0.5');
+    $r->then(bulks(['a']));
+    must($r->hKeys('h'));
+    $r->said('HKEYS h');
+    $r->then(bulks(['1']));
+    must($r->hVals('h'));
+    $r->said('HVALS h');
+    $r->then(int(1));
+    must($r->hLen('h'));
+    $r->said('HLEN h');
+    $r->then(int(1));
+    must($r->hStrLen('h', 'a'));
+    $r->said('HSTRLEN h a');
+    $r->then(arr([bulk('0'), bulks(['a', '1'])]));
+    redis::FieldPage $p = must($r->hScan('h', '0'));
+    assert($p->done() && $p->fields['a'] == '1');
+    $r->said('HSCAN h 0');
+}
+
+test list_commands_send_their_arguments_and_read_their_replies
+{
+    Recorder $r = Recorder();
+    $r->then(int(2));
+    must($r->lPush('l', ['a', 'b']));
+    $r->said('LPUSH l a b');
+    $r->then(int(2));
+    must($r->rPush('l', ['a', 'b']));
+    $r->said('RPUSH l a b');
+    $r->then(bulk('a'));
+    must($r->lPop('l'));
+    $r->said('LPOP l');
+    $r->then(bulks(['a', 'b']));
+    assert(must($r->lPop('l', count: 2))->count() == 2);
+    $r->said('LPOP l 2');
+    $r->then(redis::Reply::nil);
+    assert(must($r->rPop('l', count: 2))->empty());
+    $r->said('RPOP l 2');
+    $r->then(bulk('z'));
+    must($r->rPop('l'));
+    $r->said('RPOP l');
+    $r->then(bulks(['a']));
+    must($r->lRange('l', 0, -1));
+    $r->said('LRANGE l 0 -1');
+    $r->then(int(1));
+    must($r->lLen('l'));
+    $r->said('LLEN l');
+    $r->then(bulk('a'));
+    must($r->lIndex('l', -1));
+    $r->said('LINDEX l -1');
+    fine($r->lSet('l', 0, 'x'));
+    $r->said('LSET l 0 x');
+    $r->then(int(1));
+    must($r->lRem('l', -2, 'x'));
+    $r->said('LREM l -2 x');
+    fine($r->lTrim('l', 1, 3));
+    $r->said('LTRIM l 1 3');
+    $r->then(int(3));
+    must($r->lInsert('l', redis::Position::before, 'p', 'v'));
+    $r->said('LINSERT l BEFORE p v');
+    $r->then(bulk('v'));
+    must($r->lMove('a', 'b', redis::Side::right, redis::Side::left));
+    $r->said('LMOVE a b RIGHT LEFT');
+    $r->then(redis::Reply::nil);
+    assert(must($r->lPos('l', 'v')) == null);
+    $r->said('LPOS l v');
+    $r->then(bulks(['q', 'job']));
+    redis::KeyedValue? $kv = must($r->blPop(['q', 'q2'], time::duration::millis(1500)));
+    assert(($kv?->value ?? '') == 'job');
+    $r->said('BLPOP q q2 1.5');
+    $r->then(redis::Reply::nil);
+    assert(must($r->brPop(['q'], time::duration::secs(0))) == null);
+    $r->said('BRPOP q 0');
+    $r->then(bulk('v'));
+    must($r->blMove('a', 'b', redis::Side::left, redis::Side::right, time::duration::secs(2)));
+    $r->said('BLMOVE a b LEFT RIGHT 2');
+}
+
+test set_commands_send_their_arguments_and_read_their_replies
+{
+    Recorder $r = Recorder();
+    $r->then(int(1));
+    must($r->sAdd('s', ['a']));
+    $r->said('SADD s a');
+    $r->then(int(1));
+    must($r->sRem('s', ['a', 'b']));
+    $r->said('SREM s a b');
+    array<redis::Reply> $members = [bulk('a'), bulk('b')];
+    $r->then(redis::Reply::set($members));
+    assert(must($r->sMembers('s'))->count() == 2);
+    $r->said('SMEMBERS s');
+    $r->then(int(1));
+    must($r->sIsMember('s', 'a'));
+    $r->said('SISMEMBER s a');
+    $r->then(arr([int(1), int(0)]));
+    array<bool> $mm = must($r->smIsMember('s', ['a', 'b']));
+    assert($mm[0] && !$mm[1]);
+    $r->said('SMISMEMBER s a b');
+    $r->then(int(2));
+    must($r->sCard('s'));
+    $r->said('SCARD s');
+    $r->then(bulk('a'));
+    must($r->sPop('s'));
+    $r->said('SPOP s');
+    $r->then(bulks(['a']));
+    must($r->sPop('s', count: 3));
+    $r->said('SPOP s 3');
+    $r->then(bulk('a'));
+    must($r->sRandMember('s'));
+    $r->said('SRANDMEMBER s');
+    $r->then(bulks(['a', 'a']));
+    must($r->sRandMember('s', count: -2));
+    $r->said('SRANDMEMBER s -2');
+    $r->then(bulks(['a']));
+    must($r->sInter(['s', 't']));
+    $r->said('SINTER s t');
+    $r->then(bulks(['a']));
+    must($r->sUnion(['s', 't']));
+    $r->said('SUNION s t');
+    $r->then(bulks(['a']));
+    must($r->sDiff(['s', 't']));
+    $r->said('SDIFF s t');
+    $r->then(int(1));
+    must($r->sInterStore('d', ['s', 't']));
+    $r->said('SINTERSTORE d s t');
+    $r->then(int(1));
+    must($r->sUnionStore('d', ['s', 't']));
+    $r->said('SUNIONSTORE d s t');
+    $r->then(int(1));
+    must($r->sDiffStore('d', ['s', 't']));
+    $r->said('SDIFFSTORE d s t');
+    $r->then(int(1));
+    must($r->sMove('s', 't', 'a'));
+    $r->said('SMOVE s t a');
+    redis::ScanOptions $o = redis::ScanOptions();
+    $o->pattern = 'a*';
+    $r->then(arr([bulk('0'), bulks(['a'])]));
+    must($r->sScan('s', '5', $o));
+    $r->said('SSCAN s 5 MATCH a*');
+}
+
+test sorted_set_commands_send_their_arguments_and_read_both_score_shapes
+{
+    Recorder $r = Recorder();
+    redis::ZAddOptions $o = redis::ZAddOptions();
+    $o->condition = redis::Condition::gt;
+    $o->changed = true;
+    $r->then(int(2));
+    must($r->zAdd('z', [redis::Scored('a', 1.0), redis::Scored('b', 2.5)], $o));
+    $r->said('ZADD z GT CH 1 a 2.5 b');
+    $r->then(int(1));
+    must($r->zRem('z', ['a']));
+    $r->said('ZREM z a');
+    $r->then(redis::Reply::double(2.5));
+    assert((must($r->zScore('z', 'b')) ?? 0.0) == 2.5);
+    $r->said('ZSCORE z b');
+    $r->then(bulk('2.5'));
+    assert((must($r->zScore('z', 'b')) ?? 0.0) == 2.5);
+    $r->then(arr([redis::Reply::double(1.0), redis::Reply::nil]));
+    array<float64?> $ms = must($r->zmScore('z', ['a', 'x']));
+    assert(($ms[0] ?? 0.0) == 1.0 && $ms[1] == null);
+    $r->said('ZMSCORE z a x');
+    $r->then(redis::Reply::double(3.0));
+    must($r->zIncrBy('z', 0.5, 'b'));
+    $r->said('ZINCRBY z 0.5 b');
+
+    $r->then(bulks(['a']));
+    must($r->zRange('z', redis::ZRange(index: 0, -1)));
+    $r->said('ZRANGE z 0 -1');
+    redis::ZRange $byScore = redis::ZRange(score: redis::Bound(score: 1.0, exclusive: true), redis::Bound(score: mem::bit_cast<float64, uint64>(9218868437227405312)));
+    $byScore->rev = true;
+    $byScore->limit(0, 10);
+    $r->then(bulks(['a']));
+    must($r->zRange('z', $byScore));
+    $r->said('ZRANGE z inf (1 BYSCORE REV LIMIT 0 10');
+    $r->then(bulks(['a']));
+    must($r->zRange('z', redis::ZRange(lex: redis::Bound::first(), redis::Bound(lex: 'm'))));
+    $r->said('ZRANGE z - [m BYLEX');
+
+    // RESP3 pairs and RESP2's flat array read the same
+    $r->then(arr([arr([bulk('a'), redis::Reply::double(1.0)]), arr([bulk('b'), redis::Reply::double(2.0)])]));
+    array<redis::Scored> $three = must($r->zRangeWithScores('z', redis::ZRange(index: 0, -1)));
+    $r->said('ZRANGE z 0 -1 WITHSCORES');
+    $r->then(bulks(['a', '1', 'b', '2']));
+    array<redis::Scored> $two = must($r->zRangeWithScores('z', redis::ZRange(index: 0, -1)));
+    assert($three->count() == 2 && $two->count() == 2);
+    assert($three[1]->member == $two[1]->member && $three[1]->score == $two[1]->score);
+    $r->then(bulks(['a', '1', 'b']));
+    assert(fails($r->zRangeWithScores('z', redis::ZRange(index: 0, -1)))->name() == 'unexpected');
+
+    $r->then(int(2));
+    must($r->zRangeStore('d', 'z', redis::ZRange(index: 0, 1)));
+    $r->said('ZRANGESTORE d z 0 1');
+    $r->then(int(0));
+    assert((must($r->zRank('z', 'a')) ?? -1) == 0);
+    $r->said('ZRANK z a');
+    $r->then(redis::Reply::nil);
+    assert(must($r->zRevRank('z', 'q')) == null);
+    $r->said('ZREVRANK z q');
+    $r->then(int(2));
+    must($r->zCard('z'));
+    $r->said('ZCARD z');
+    $r->then(int(1));
+    must($r->zCount('z', redis::Bound(score: 0.0), redis::Bound(score: 1.0)));
+    $r->said('ZCOUNT z 0 1');
+
+    $r->then(arr([bulk('a'), redis::Reply::double(1.0)]));
+    redis::Scored? $min = must($r->zPopMin('z'));
+    assert(($min?->member ?? '') == 'a');
+    $r->said('ZPOPMIN z');
+    $r->then(arr(array<redis::Reply>()));
+    assert(must($r->zPopMax('z')) == null);
+    $r->said('ZPOPMAX z');
+    $r->then(arr([arr([bulk('a'), redis::Reply::double(1.0)])]));
+    assert(must($r->zPopMin('z', count: 2))->count() == 1);
+    $r->said('ZPOPMIN z 2');
+    $r->then(bulks(['a', '1']));
+    assert(must($r->zPopMax('z', count: 2))->count() == 1);
+    $r->said('ZPOPMAX z 2');
+    $r->then(arr([bulk('z'), bulk('a'), redis::Reply::double(1.0)]));
+    redis::KeyedScore? $ks = must($r->bzPopMin(['z'], time::duration::secs(1)));
+    assert(($ks?->key ?? '') == 'z' && ($ks?->score ?? 0.0) == 1.0);
+    $r->said('BZPOPMIN z 1');
+    $r->then(redis::Reply::nil);
+    assert(must($r->bzPopMax(['z'], time::duration::millis(250))) == null);
+    $r->said('BZPOPMAX z 0.25');
+    $r->then(int(1));
+    must($r->zRemRangeByRank('z', 0, 0));
+    $r->said('ZREMRANGEBYRANK z 0 0');
+    $r->then(int(1));
+    must($r->zRemRangeByScore('z', redis::Bound(score: mem::bit_cast<float64, uint64>(18442240474082181120)), redis::Bound(score: 5.0)));
+    $r->said('ZREMRANGEBYSCORE z -inf 5');
+    $r->then(int(1));
+    must($r->zRemRangeByLex('z', redis::Bound(lex: 'a', exclusive: true), redis::Bound::last()));
+    $r->said('ZREMRANGEBYLEX z (a +');
+    $r->then(arr([bulk('0'), bulks(['a', '1.5'])]));
+    redis::ScoredPage $p = must($r->zScan('z', '0'));
+    assert($p->members[0]->score == 1.5);
+    $r->said('ZSCAN z 0');
+}
+
+test stream_commands_send_their_arguments_and_read_their_replies
+{
+    Recorder $r = Recorder();
+    redis::XAddOptions $o = redis::XAddOptions();
+    $o->noMkStream = true;
+    redis::Trim $t = redis::Trim(maxLen: 1000);
+    $o->trim = $t;
+    $r->then(bulk('1-0'));
+    assert((must($r->xAdd('x', ['a' => '1', 'b' => '2'], $o)) ?? '') == '1-0');
+    $r->said('XADD x NOMKSTREAM MAXLEN ~ 1000 * a 1 b 2');
+    $r->then(int(1));
+    must($r->xLen('x'));
+    $r->said('XLEN x');
+    $r->then(int(1));
+    must($r->xDel('x', ['1-0']));
+    $r->said('XDEL x 1-0');
+    redis::Trim $exact = redis::Trim(minId: '5-0');
+    $exact->approximate = false;
+    $r->then(int(3));
+    must($r->xTrim('x', $exact));
+    $r->said('XTRIM x MINID = 5-0');
+
+    redis::Reply $entry = arr([bulk('1-0'), bulks(['a', '1'])]);
+    redis::Reply $deleted = arr([bulk('2-0'), redis::Reply::nil]);
+    $r->then(arr([$entry, $deleted]));
+    array<redis::StreamEntry> $es = must($r->xRange('x'));
+    assert($es->count() == 2 && $es[0]->fields['a'] == '1' && $es[1]->fields->empty());
+    $r->said('XRANGE x - +');
+    $r->then(arr([$entry]));
+    must($r->xRevRange('x', '+', '-', count: 1));
+    $r->said('XREVRANGE x + - COUNT 1');
+
+    // RESP3 map and RESP2 array of [stream, entries] read the same; nil is none
+    array<redis::Pair> $byStream = [redis::Pair(bulk('x'), arr([$entry]))];
+    $r->then(redis::Reply::map($byStream));
+    array<redis::StreamMessages> $m3 = must($r->xRead(['x' => '0', 'y' => '$'], count: 10, block: time::duration::millis(500)));
+    $r->said('XREAD COUNT 10 BLOCK 500 STREAMS x y 0 $');
+    $r->then(arr([arr([bulk('x'), arr([$entry])])]));
+    array<redis::StreamMessages> $m2 = must($r->xRead(['x' => '0']));
+    assert($m3[0]->stream == 'x' && $m2[0]->stream == 'x' && $m2[0]->entries[0]->id == '1-0');
+    $r->then(redis::Reply::nil);
+    assert(must($r->xRead(['x' => '$'], block: time::duration::millis(1)))->empty());
+    $r->then(redis::Reply::nil);
+    must($r->xReadGroup('g', 'c', ['x' => '>'], count: 1, noAck: true));
+    $r->said('XREADGROUP GROUP g c COUNT 1 NOACK STREAMS x >');
+
+    $r->then(int(1));
+    must($r->xAck('x', 'g', ['1-0']));
+    $r->said('XACK x g 1-0');
+    fine($r->xGroupCreate('x', 'g', '0', mkStream: true));
+    $r->said('XGROUP CREATE x g 0 MKSTREAM');
+    fine($r->xGroupCreate('x', 'g'));
+    $r->said('XGROUP CREATE x g $');
+    $r->then(int(1));
+    must($r->xGroupDestroy('x', 'g'));
+    $r->said('XGROUP DESTROY x g');
+    $r->then(int(0));
+    must($r->xGroupDelConsumer('x', 'g', 'c'));
+    $r->said('XGROUP DELCONSUMER x g c');
+
+    $r->then(arr([int(2), bulk('1-0'), bulk('2-0'), arr([bulks(['c', '1']), bulks(['c2', '1'])])]));
+    redis::PendingSummary $sum = must($r->xPending('x', 'g'));
+    $r->said('XPENDING x g');
+    assert($sum->count == 2 && ($sum->lowest ?? '') == '1-0' && $sum->consumers[1]->name == 'c2' && $sum->consumers[1]->count == 1);
+    $r->then(arr([int(0), redis::Reply::nil, redis::Reply::nil, redis::Reply::nil]));
+    redis::PendingSummary $none = must($r->xPending('x', 'g'));
+    assert($none->count == 0 && $none->lowest == null && $none->consumers->empty());
+    $r->then(arr([arr([bulk('1-0'), bulk('c'), int(500), int(2)])]));
+    array<redis::PendingEntry> $pe = must($r->xPendingRange('x', 'g', '-', '+', 10, consumer: 'c', minIdle: time::duration::secs(1)));
+    assert($pe[0]->idleMillis == 500 && $pe[0]->deliveries == 2);
+    $r->said('XPENDING x g IDLE 1000 - + 10 c');
+    $r->then(arr([$entry]));
+    must($r->xClaim('x', 'g', 'c', time::duration::millis(10), ['1-0']));
+    $r->said('XCLAIM x g c 10 1-0');
+    $r->then(arr([bulk('0-0'), arr([$entry]), bulks(['3-0'])]));
+    redis::AutoClaimed $ac = must($r->xAutoClaim('x', 'g', 'c', time::duration::millis(10), count: 5));
+    assert($ac->next == '0-0' && $ac->entries->count() == 1 && $ac->deleted[0] == '3-0');
+    $r->said('XAUTOCLAIM x g c 10 0-0 COUNT 5');
+}
+
+test script_and_server_commands_send_their_arguments
+{
+    Recorder $r = Recorder();
+    redis::Script $s = redis::Script('return 1');
+    assert($s->sha == 'e0e1f9fabfc9d4800c877a703b823ac0578ff8db');
+    // EVALSHA first; NOSCRIPT sends the source
+    $r->then(redis::Reply::error(redis::ServerError('NOSCRIPT', 'No matching script.')));
+    $r->then(int(1));
+    assert((must($r->eval($s, ['k'], ['a']))->int() ?? 0) == 1);
+    assert($r->sent[0] == "EVALSHA {$s->sha} 1 k a");
+    $r->said('EVAL return 1 1 k a');
+    // another error is not retried
+    $r->then(redis::Reply::error(redis::ServerError('ERR', 'boom')));
+    assert(fails($r->eval($s))->is('ERR'));
+    $r->said("EVALSHA {$s->sha} 0");
+    $r->then(int(1));
+    must($r->evalSha('abc', ['k1', 'k2']));
+    $r->said('EVALSHA abc 2 k1 k2');
+    $r->then(bulk('abc'));
+    must($r->scriptLoad('return 2'));
+    $r->said('SCRIPT LOAD return 2');
+    $r->then(arr([int(1), int(0)]));
+    array<bool> $ex = must($r->scriptExists(['a', 'b']));
+    assert($ex[0] && !$ex[1]);
+    $r->said('SCRIPT EXISTS a b');
+    fine($r->scriptFlush());
+    $r->said('SCRIPT FLUSH');
+    $r->then(int(3));
+    must($r->fCall('f', ['k'], ['1']));
+    $r->said('FCALL f 1 k 1');
+    $r->then(int(3));
+    must($r->fCallRo('f'));
+    $r->said('FCALL_RO f 0');
+    $r->then(bulk('lib'));
+    must($r->functionLoad('code', replace: true));
+    $r->said('FUNCTION LOAD REPLACE code');
+    fine($r->functionDelete('lib'));
+    $r->said('FUNCTION DELETE lib');
+
+    $r->then(redis::Reply::simple('PONG'));
+    fine($r->ping());
+    $r->said('PING');
+    $r->then(int(4));
+    must($r->dbSize());
+    $r->said('DBSIZE');
+    fine($r->flushDb(async: true));
+    $r->said('FLUSHDB ASYNC');
+    fine($r->flushAll());
+    $r->said('FLUSHALL');
+    $r->then(redis::Reply::verbatim('txt', '# Server'));
+    assert(must($r->info('server')) == '# Server');
+    $r->said('INFO server');
+    $r->then(bulk('x'));
+    must($r->info());
+    $r->said('INFO');
+    $r->then(bulks(['1700000000', '123456']));
+    assert(must($r->time()) == 1700000000123456);
+    $r->said('TIME');
+    fine($r->clientSetName('n'));
+    $r->said('CLIENT SETNAME n');
+    $r->then(redis::Reply::nil);
+    must($r->clientGetName());
+    $r->said('CLIENT GETNAME');
+    $r->then(int(7));
+    must($r->clientId());
+    $r->said('CLIENT ID');
+    $r->then(int(1));
+    must($r->publish('ch', 'hi'));
+    $r->said('PUBLISH ch hi');
+    $r->then(int(1));
+    must($r->sPublish('ch', 'hi'));
+    $r->said('SPUBLISH ch hi');
+}
+
+test a_reply_of_the_wrong_shape_is_unexpected_not_a_crash
+{
+    Recorder $r = Recorder();
+    $r->then(int(5));
+    redis::Error $e = fails($r->get('k'));
+    assert($e->name() == 'unexpected');
+    assert($e->message() == 'unexpected reply: a string expected, int received');
+    $r->then(bulk('x'));
+    assert(fails($r->incr('k'))->name() == 'unexpected');
+    $r->then(arr([int(1)]));
+    assert(fails($r->mGet(['a']))->name() == 'unexpected');
+    $r->then(int(2));
+    assert(fails($r->sIsMember('s', 'a'))->name() == 'unexpected');
+    $r->then(arr([bulk('a')]));
+    assert(fails($r->scan('0'))->name() == 'unexpected');
+    $r->then(arr([bulk('k')]));
+    assert(fails($r->blPop(['k'], time::duration::secs(1)))->name() == 'unexpected');
+    $r->then(arr([bulk('1-0')]));
+    assert(fails($r->xRange('x'))->name() == 'unexpected');
+    $r->then(redis::Reply::error(redis::ServerError('WRONGTYPE', 'nope')));
+    assert(fails($r->get('k'))->is('WRONGTYPE'));
+}
+
+/**
+ * Settles every batch from a script, writing down what each command was.
+ */
+internal class ScriptedRunner : redis::Runner, redis::Atomic
+{
+    internal array<string> $sent;
+    internal array<redis::Reply> $answers;
+    internal redis::Error? $failure;
+
+    internal constructor()
+    {
+        $this->sent = array<string>();
+        $this->answers = array<redis::Reply>();
+        $this->failure = null;
+    }
+
+    public function exchange(redis::Batch $batch, tcp::Deadline? $by) : void
+    {
+        redis::Error? $f = $this->failure;
+        if ($f != null) {
+            redis::Error $e = guard $f;
+            $batch->fail($e);
+            return;
+        }
+        array<redis::Reply> $replies = array<redis::Reply>();
+        foreach ($batch->commands as const &$c) {
+            $this->sent->push(str::join($c->args(), ' '));
+            $replies->push($this->answers[0]);
+            $this->answers->remove(0);
+        }
+        $batch->settle(mv $replies);
+    }
+
+    public function transact(redis::Batch $batch, tcp::Deadline? $by) : void
+    {
+        $this->exchange($batch, $by);
+    }
+
+    public function unwatch(by: tcp::Deadline? $by = null) : status<redis::Error>
+    {
+        return .ok;
+    }
+}
+
+test a_pipeline_queues_the_same_commands_and_reads_the_same_replies
+{
+    ScriptedRunner $run = ScriptedRunner();
+    redis::Pipeline $p = redis::Pipeline($run);
+    redis::Deferred<string?> $get = $p->get('k');
+    redis::Deferred<bool> $set = $p->set('k', 'v', ttl: time::duration::secs(1));
+    redis::Deferred<ordered_map<string, string>> $h = $p->hGetAll('h');
+    redis::Deferred<array<redis::Scored>> $z = $p->zRangeWithScores('z', redis::ZRange(index: 0, -1));
+    redis::Deferred<redis::KeyedValue?> $pop = $p->blPop(['q'], time::duration::secs(1));
+    redis::Deferred<array<redis::StreamMessages>> $x = $p->xRead(['x' => '0'], count: 1);
+    redis::Deferred<bool> $ping = $p->ping();
+    redis::Deferred<int64> $bad = $p->incr('k');
+    redis::Deferred<redis::Reply> $raw = $p->add(['ECHO', 'hi']);
+    $run->answers = [bulk('v'), redis::Reply::simple('OK'), bulks(['a', '1']), bulks(['m', '2']), redis::Reply::nil, redis::Reply::nil, redis::Reply::simple('PONG'), redis::Reply::error(redis::ServerError('ERR', 'not an integer')), bulk('hi')];
+    fine($p->run());
+    assert($run->sent[0] == 'GET k');
+    assert($run->sent[1] == 'SET k v PX 1000');
+    assert($run->sent[4] == 'BLPOP q 1');
+    assert($run->sent[5] == 'XREAD COUNT 1 STREAMS x 0');
+    assert((must($get->value()) ?? '') == 'v');
+    assert(must($set->value()));
+    assert(must($h->value())['a'] == '1');
+    assert(must($z->value())[0]->score == 2.0);
+    assert(must($pop->value()) == null);
+    assert(must($x->value())->empty());
+    assert(must($ping->value()));
+    assert(fails($bad->value())->is('ERR'));
+    assert((must($raw->value())->text() ?? '') == 'hi');
+
+    // a pipeline that could not run fails every handle with its reason
+    $run->failure = redis::Error::timeout;
+    redis::Deferred<string?> $late = $p->get('k');
+    assert(failsStatus($p->run())->name() == 'timeout');
+    assert(fails($late->value())->name() == 'timeout');
+    // nothing queued: nothing sent
+    fine($p->run());
+}
+
+test a_transaction_queues_through_the_same_mixins
+{
+    ScriptedRunner $run = ScriptedRunner();
+    redis::Transaction $tx = redis::Transaction($run);
+    redis::Deferred<int64> $n = $tx->incr('n');
+    redis::Deferred<redis::Reply> $e = $tx->eval(redis::Script('return 1'), ['n']);
+    assert($tx->count() == 2);
+    $run->answers = [int(1), int(1)];
+    fine($tx->exec());
+    assert(must($n->value()) == 1);
+    assert($run->sent[1] == 'EVAL return 1 1 n');
+    fine($tx->discard());
+}
+
+test a_blocking_timeout_under_a_millisecond_is_one_not_forever
+{
+    Recorder $r = Recorder();
+    $r->then(redis::Reply::nil);
+    must($r->blPop(['q'], time::duration::micros(500)));
+    $r->said('BLPOP q 0.001');
+    $r->then(redis::Reply::nil);
+    must($r->bzPopMin(['z'], time::duration::nanos(1)));
+    $r->said('BZPOPMIN z 0.001');
+    $r->then(redis::Reply::nil);
+    must($r->xRead(['x' => '$'], block: time::duration::micros(10)));
+    $r->said('XREAD BLOCK 1 STREAMS x $');
+    // zero stays zero: as long as it takes
+    $r->then(redis::Reply::nil);
+    must($r->blPop(['q'], time::duration::zero()));
+    $r->said('BLPOP q 0');
+    assert((redis::Command('BLPOP')->blocking(time::duration::micros(1))->blocks()?->as_millis() ?? -1) == 1);
+    assert((redis::Command('BLPOP')->blocking(time::duration::zero())->blocks()?->as_millis() ?? -1) == 0);
+}

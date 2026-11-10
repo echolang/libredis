@@ -1,0 +1,27 @@
+namespace redis;
+
+/**
+ * A Lua script, with the SHA-1 the server caches it under. `eval` sends the SHA-1 and falls back
+ * to the source when the server does not have it, so a script made once runs cheaply after the
+ * first call.
+ *
+ * ```echo
+ * redis::Script $add = redis::Script('return redis.call("INCRBY", KEYS[1], ARGV[1])');
+ * redis::Reply $n = guard $r->eval($add, ['hits'], ['5']);
+ * ```
+ */
+public struct Script
+{
+    public const string $source;
+
+    /**
+     * The SHA-1 of the source, in lowercase hex.
+     */
+    public const string $sha;
+
+    public constructor(const string& $source)
+    {
+        $this->source = $source;
+        $this->sha = crypto::hex(crypto::sha1($source));
+    }
+}

@@ -1,0 +1,534 @@
+namespace redis;
+
+/**
+ * Replies read into what the typed commands return, one reader per shape of reply. Each takes
+ * RESP2 and RESP3 alike: a map or a flat array, a double or a string holding one, a boolean or
+ * 0 and 1. A reply of another shape is `Error::unexpected`.
+ */
+internal struct Decode
+{
+    internal static function wrong(const Reply& $r, const string& $wanted) : Error
+    {
+        return .unexpected("{$wanted} expected, {$r->kind()} received");
+    }
+
+    /**
+     * An array of exactly `n` replies, or `what` expected.
+     */
+    private static function tuple(const Reply& $r, usize $n, const string& $what) : result<array<Reply>, Error>
+    {
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, $what));
+        }
+        if ($items->count() != $n) {
+            return .error(Decode::wrong($r, $what));
+        }
+        return .ok($items);
+    }
+
+    /**
+     * The reply itself, error replies inside it included.
+     */
+    internal static function reply(const Reply& $r) : result<Reply, Error>
+    {
+        return .ok($r);
+    }
+
+    /**
+     * Any reply that is not an error: `OK`, mostly.
+     */
+    internal static function done(const Reply& $r) : result<bool, Error>
+    {
+        return .ok(true);
+    }
+
+    /**
+     * `OK` for done, nil for a condition that stopped the write.
+     */
+    internal static function written(const Reply& $r) : result<bool, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(false);
+        }
+        return .ok(true);
+    }
+
+    internal static function text(const Reply& $r) : result<string?, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(null);
+        }
+        string $t = try Decode::bytes($r);
+        return .ok($t);
+    }
+
+    internal static function bytes(const Reply& $r) : result<string, Error>
+    {
+        string $t = guard $r->text() else {
+            return .error(Decode::wrong($r, 'a string'));
+        }
+        return .ok($t);
+    }
+
+    internal static function int(const Reply& $r) : result<int64, Error>
+    {
+        int64 $n = guard $r->int() else {
+            return .error(Decode::wrong($r, 'an integer'));
+        }
+        return .ok($n);
+    }
+
+    internal static function intOrNil(const Reply& $r) : result<int64?, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(null);
+        }
+        int64 $n = try Decode::int($r);
+        return .ok($n);
+    }
+
+    internal static function flag(const Reply& $r) : result<bool, Error>
+    {
+        bool $b = guard $r->bool() else {
+            return .error(Decode::wrong($r, 'a boolean'));
+        }
+        return .ok($b);
+    }
+
+    internal static function float(const Reply& $r) : result<float64, Error>
+    {
+        float64 $x = guard $r->float() else {
+            return .error(Decode::wrong($r, 'a number'));
+        }
+        return .ok($x);
+    }
+
+    internal static function floatOrNil(const Reply& $r) : result<float64?, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(null);
+        }
+        float64 $x = try Decode::float($r);
+        return .ok($x);
+    }
+
+    /**
+     * An array or a set of strings. Nil is none.
+     */
+    internal static function texts(const Reply& $r) : result<array<string>, Error>
+    {
+        // the elements are read where they are: items() would copy the array first
+        match ($r) {
+            Reply::array($a) => {
+                return Decode::allTexts($a);
+            },
+            Reply::set($s) => {
+                return Decode::allTexts($s);
+            },
+            Reply::nil => {
+                return .ok(array<string>());
+            },
+            else => {
+                return .error(Decode::wrong($r, 'an array of strings'));
+            },
+        }
+    }
+
+    private static function allTexts(const array<Reply>& $items) : result<array<string>, Error>
+    {
+        array<string> $out = arr::room<string>($items->count());
+        foreach ($items as const &$item) {
+            string $t = try Decode::bytes($item);
+            $out->push(mv $t);
+        }
+        return .ok($out);
+    }
+
+    /**
+     * An array of strings and nils.
+     */
+    internal static function maybeTexts(const Reply& $r) : result<array<string?>, Error>
+    {
+        match ($r) {
+            Reply::array($a) => {
+                array<string?> $out = arr::room<string?>($a->count());
+                foreach ($a as const &$item) {
+                    if ($item->isNil()) {
+                        $out->push(null);
+                        continue;
+                    }
+                    string? $t = $item->text();
+                    if ($t == null) {
+                        return .error(Decode::wrong($item, 'a string'));
+                    }
+                    $out->push(mv $t);
+                }
+                return .ok($out);
+            },
+            else => {
+                return .error(Decode::wrong($r, 'an array'));
+            },
+        }
+    }
+
+    /**
+     * A map of strings, or RESP2's flat array of names and values.
+     */
+    internal static function textMap(const Reply& $r) : result<ordered_map<string, string>, Error>
+    {
+        match ($r) {
+            Reply::map($m) => {
+                ordered_map<string, string> $out = ordered_map<string, string>();
+                foreach ($m as const &$p) {
+                    string $k = try Decode::bytes($p->key);
+                    string $v = try Decode::bytes($p->value);
+                    $out[$k] = $v;
+                }
+                return .ok($out);
+            },
+            Reply::array($a) => {
+                return Decode::mapOfFlat($a, $r);
+            },
+            Reply::nil => {
+                return .ok(ordered_map<string, string>());
+            },
+            else => {
+                return .error(Decode::wrong($r, 'a map'));
+            },
+        }
+    }
+
+    private static function mapOfFlat(const array<Reply>& $items, const Reply& $whole) : result<ordered_map<string, string>, Error>
+    {
+        if ($items->count() % 2 != 0) {
+            return .error(Decode::wrong($whole, 'a map'));
+        }
+        ordered_map<string, string> $out = ordered_map<string, string>();
+        usize $i = 0;
+        while ($i < $items->count()) {
+            string $k = try Decode::bytes($items[$i]);
+            string $v = try Decode::bytes($items[$i + 1]);
+            $out[$k] = $v;
+            $i = $i + 2;
+        }
+        return .ok($out);
+    }
+
+    internal static function flags(const Reply& $r) : result<array<bool>, Error>
+    {
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, 'an array'));
+        }
+        array<bool> $out = arr::room<bool>($items->count());
+        foreach ($items as const &$item) {
+            bool $b = try Decode::flag($item);
+            $out->push($b);
+        }
+        return .ok($out);
+    }
+
+    internal static function floats(const Reply& $r) : result<array<float64?>, Error>
+    {
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, 'an array'));
+        }
+        array<float64?> $out = arr::room<float64?>($items->count());
+        foreach ($items as const &$item) {
+            if ($item->isNil()) {
+                $out->push(null);
+                continue;
+            }
+            float64 $x = try Decode::float($item);
+            $out->push($x);
+        }
+        return .ok($out);
+    }
+
+    /**
+     * Members with scores: RESP3's array of `[member, score]` pairs, or RESP2's flat array of
+     * member, score, member, score.
+     */
+    internal static function scored(const Reply& $r) : result<array<Scored>, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(array<Scored>());
+        }
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, 'an array'));
+        }
+        array<Scored> $out = array<Scored>();
+        if (!$items->empty() && $items[0]->items() != null) {
+            $out->reserve($items->count());
+            foreach ($items as const &$pair) {
+                Scored $s = try Decode::member($pair);
+                $out->push($s);
+            }
+            return .ok($out);
+        }
+        if ($items->count() % 2 != 0) {
+            return .error(Decode::wrong($r, 'members and scores'));
+        }
+        $out->reserve($items->count() / 2);
+        usize $i = 0;
+        while ($i < $items->count()) {
+            string $m = guard $items[$i]->text() else {
+                return .error(Decode::wrong($items[$i], 'a member'));
+            }
+            float64 $s = guard $items[$i + 1]->float() else {
+                return .error(Decode::wrong($items[$i + 1], 'a score'));
+            }
+            $out->push(Scored($m, $s));
+            $i = $i + 2;
+        }
+        return .ok($out);
+    }
+
+    /**
+     * One `[member, score]`. Empty (nothing popped) is null.
+     */
+    internal static function scoredOne(const Reply& $r) : result<Scored?, Error>
+    {
+        array<Scored> $all = try Decode::scored($r);
+        if ($all->empty()) {
+            return .ok(null);
+        }
+        return .ok($all[0]);
+    }
+
+    private static function member(const Reply& $pair) : result<Scored, Error>
+    {
+        array<Reply> $two = try Decode::tuple($pair, 2, 'a member and a score');
+        string $m = guard $two[0]->text() else {
+            return .error(Decode::wrong($two[0], 'a member'));
+        }
+        float64 $s = guard $two[1]->float() else {
+            return .error(Decode::wrong($two[1], 'a score'));
+        }
+        return .ok(Scored($m, $s));
+    }
+
+    /**
+     * `[key, member, score]`, or nil when the wait ran out.
+     */
+    internal static function keyedScore(const Reply& $r) : result<KeyedScore?, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(null);
+        }
+        array<Reply> $items = try Decode::tuple($r, 3, 'a key, a member and a score');
+        string $k = guard $items[0]->text() else {
+            return .error(Decode::wrong($items[0], 'a key'));
+        }
+        string $m = guard $items[1]->text() else {
+            return .error(Decode::wrong($items[1], 'a member'));
+        }
+        float64 $s = guard $items[2]->float() else {
+            return .error(Decode::wrong($items[2], 'a score'));
+        }
+        return .ok(KeyedScore($k, $m, $s));
+    }
+
+    /**
+     * `[key, value]`, or nil when the wait ran out.
+     */
+    internal static function keyedValue(const Reply& $r) : result<KeyedValue?, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(null);
+        }
+        array<Reply> $items = try Decode::tuple($r, 2, 'a key and a value');
+        string $k = guard $items[0]->text() else {
+            return .error(Decode::wrong($items[0], 'a key'));
+        }
+        string $v = guard $items[1]->text() else {
+            return .error(Decode::wrong($items[1], 'a value'));
+        }
+        return .ok(KeyedValue($k, $v));
+    }
+
+    /**
+     * `[cursor, items]`: the cursor and the raw items of a scan page.
+     */
+    private static function page(const Reply& $r, string& $cursor) : result<Reply, Error>
+    {
+        array<Reply> $two = try Decode::tuple($r, 2, 'a cursor and a page');
+        string $c = guard $two[0]->text() else {
+            return .error(Decode::wrong($two[0], 'a cursor'));
+        }
+        $cursor = $c;
+        return .ok($two[1]);
+    }
+
+    internal static function scan(const Reply& $r) : result<ScanPage, Error>
+    {
+        string $c = '';
+        Reply $items = try Decode::page($r, $c);
+        array<string> $names = try Decode::texts($items);
+        return .ok(ScanPage($c, $names));
+    }
+
+    internal static function fieldScan(const Reply& $r) : result<FieldPage, Error>
+    {
+        string $c = '';
+        Reply $items = try Decode::page($r, $c);
+        ordered_map<string, string> $fields = try Decode::textMap($items);
+        return .ok(FieldPage($c, $fields));
+    }
+
+    internal static function scoredScan(const Reply& $r) : result<ScoredPage, Error>
+    {
+        string $c = '';
+        Reply $items = try Decode::page($r, $c);
+        array<Scored> $members = try Decode::scored($items);
+        return .ok(ScoredPage($c, $members));
+    }
+
+    /**
+     * `[id, [field, value, ...]]`, the fields nil for an entry deleted since it was delivered.
+     */
+    internal static function entry(const Reply& $r) : result<StreamEntry, Error>
+    {
+        array<Reply> $two = try Decode::tuple($r, 2, 'a stream entry');
+        string $id = guard $two[0]->text() else {
+            return .error(Decode::wrong($two[0], 'an entry id'));
+        }
+        ordered_map<string, string> $fields = try Decode::textMap($two[1]);
+        return .ok(StreamEntry($id, $fields));
+    }
+
+    internal static function entries(const Reply& $r) : result<array<StreamEntry>, Error>
+    {
+        if ($r->isNil()) {
+            return .ok(array<StreamEntry>());
+        }
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, 'stream entries'));
+        }
+        array<StreamEntry> $out = arr::room<StreamEntry>($items->count());
+        foreach ($items as const &$item) {
+            StreamEntry $e = try Decode::entry($item);
+            $out->push($e);
+        }
+        return .ok($out);
+    }
+
+    /**
+     * What `xread` and `xreadGroup` answer: RESP3's map of stream to entries, or RESP2's array of
+     * `[stream, entries]`. Nil (the wait ran out) is none.
+     */
+    internal static function streams(const Reply& $r) : result<array<StreamMessages>, Error>
+    {
+        array<StreamMessages> $out = array<StreamMessages>();
+        if ($r->isNil()) {
+            return .ok($out);
+        }
+        array<Pair> $pairs = array<Pair>();
+        array<Reply>? $list = $r->items();
+        if ($list != null) {
+            array<Reply> $items = guard $list;
+            foreach ($items as const &$item) {
+                array<Reply> $two = try Decode::tuple($item, 2, 'a stream and its entries');
+                $pairs->push(Pair($two[0], $two[1]));
+            }
+        } else {
+            array<Pair> $m = guard $r->pairs() else {
+                return .error(Decode::wrong($r, 'streams'));
+            }
+            $pairs = $m;
+        }
+        $out->reserve($pairs->count());
+        foreach ($pairs as const &$p) {
+            string $name = guard $p->key->text() else {
+                return .error(Decode::wrong($p->key, 'a stream name'));
+            }
+            array<StreamEntry> $es = try Decode::entries($p->value);
+            $out->push(StreamMessages($name, $es));
+        }
+        return .ok($out);
+    }
+
+    internal static function pendingSummary(const Reply& $r) : result<PendingSummary, Error>
+    {
+        array<Reply> $four = try Decode::tuple($r, 4, 'a pending summary');
+        int64 $count = guard $four[0]->int() else {
+            return .error(Decode::wrong($four[0], 'a count'));
+        }
+        array<PendingConsumer> $consumers = array<PendingConsumer>();
+        if (!$four[3]->isNil()) {
+            array<Reply> $list = guard $four[3]->items() else {
+                return .error(Decode::wrong($four[3], 'consumers'));
+            }
+            foreach ($list as const &$c) {
+                array<Reply> $two = try Decode::tuple($c, 2, 'a consumer and a count');
+                string $name = guard $two[0]->text() else {
+                    return .error(Decode::wrong($two[0], 'a consumer'));
+                }
+                int64 $n = guard $two[1]->int() else {
+                    return .error(Decode::wrong($two[1], 'a count'));
+                }
+                $consumers->push(PendingConsumer($name, $n));
+            }
+        }
+        return .ok(PendingSummary($count, $four[1]->text(), $four[2]->text(), $consumers));
+    }
+
+    internal static function pendingEntries(const Reply& $r) : result<array<PendingEntry>, Error>
+    {
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, 'pending entries'));
+        }
+        array<PendingEntry> $out = arr::room<PendingEntry>($items->count());
+        foreach ($items as const &$item) {
+            array<Reply> $four = try Decode::tuple($item, 4, 'a pending entry');
+            string $id = guard $four[0]->text() else {
+                return .error(Decode::wrong($four[0], 'an entry id'));
+            }
+            string $consumer = guard $four[1]->text() else {
+                return .error(Decode::wrong($four[1], 'a consumer'));
+            }
+            int64 $idle = guard $four[2]->int() else {
+                return .error(Decode::wrong($four[2], 'an idle time'));
+            }
+            int64 $deliveries = guard $four[3]->int() else {
+                return .error(Decode::wrong($four[3], 'a delivery count'));
+            }
+            $out->push(PendingEntry($id, $consumer, $idle, $deliveries));
+        }
+        return .ok($out);
+    }
+
+    internal static function autoClaimed(const Reply& $r) : result<AutoClaimed, Error>
+    {
+        array<Reply> $parts = guard $r->items() else {
+            return .error(Decode::wrong($r, 'an autoclaim'));
+        }
+        if ($parts->count() < 2) {
+            return .error(Decode::wrong($r, 'an autoclaim'));
+        }
+        string $next = guard $parts[0]->text() else {
+            return .error(Decode::wrong($parts[0], 'a cursor'));
+        }
+        array<StreamEntry> $entries = try Decode::entries($parts[1]);
+        array<string> $deleted = array<string>();
+        if ($parts->count() > 2) {
+            array<string> $gone = try Decode::texts($parts[2]);
+            $deleted = $gone;
+        }
+        return .ok(AutoClaimed($next, $entries, $deleted));
+    }
+
+    /**
+     * `TIME`'s seconds and microseconds, as microseconds since the Unix epoch.
+     */
+    internal static function micros(const Reply& $r) : result<int64, Error>
+    {
+        array<Reply> $two = try Decode::tuple($r, 2, 'seconds and microseconds');
+        int64 $s = guard $two[0]->int() else {
+            return .error(Decode::wrong($two[0], 'seconds'));
+        }
+        int64 $us = guard $two[1]->int() else {
+            return .error(Decode::wrong($two[1], 'microseconds'));
+        }
+        return .ok($s * 1000000 + $us);
+    }
+}

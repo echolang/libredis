@@ -1,0 +1,142 @@
+/**
+ * What typed commands answer with beyond strings and numbers.
+ */
+
+namespace redis;
+
+/**
+ * A sorted set member and its score.
+ */
+public struct Scored
+{
+    public string $member;
+    public float64 $score;
+}
+
+/**
+ * A value popped by a blocking pop, and the key it came from.
+ */
+public struct KeyedValue
+{
+    public string $key;
+    public string $value;
+}
+
+/**
+ * A sorted set member popped by `bzpopmin` or `bzpopmax`, and the key it came from.
+ */
+public struct KeyedScore
+{
+    public string $key;
+    public string $member;
+    public float64 $score;
+}
+
+/**
+ * One page of a `scan` or `sscan`: the names, and the cursor for the next page, `'0'` after the
+ * last.
+ */
+public struct ScanPage
+{
+    public string $cursor;
+    public array<string> $items;
+
+    /**
+     * True on the last page.
+     */
+    public const function done() : bool
+    {
+        return $this->cursor == '0';
+    }
+}
+
+/**
+ * One page of an `hscan`.
+ */
+public struct FieldPage
+{
+    public string $cursor;
+    public ordered_map<string, string> $fields;
+
+    public const function done() : bool
+    {
+        return $this->cursor == '0';
+    }
+}
+
+/**
+ * One page of a `zscan`.
+ */
+public struct ScoredPage
+{
+    public string $cursor;
+    public array<Scored> $members;
+
+    public const function done() : bool
+    {
+        return $this->cursor == '0';
+    }
+}
+
+/**
+ * One stream entry: its id and its fields, in the order they were added. A pending entry that
+ * was deleted since comes back with no fields.
+ */
+public struct StreamEntry
+{
+    public string $id;
+    public ordered_map<string, string> $fields;
+}
+
+/**
+ * The entries read from one stream by `xread` or `xreadGroup`.
+ */
+public struct StreamMessages
+{
+    public string $stream;
+    public array<StreamEntry> $entries;
+}
+
+/**
+ * How many entries a consumer has pending.
+ */
+public struct PendingConsumer
+{
+    public string $name;
+    public int64 $count;
+}
+
+/**
+ * What `xpending` says about a group: how many entries are delivered and not acknowledged, the
+ * lowest and highest of their ids, and who holds them.
+ */
+public struct PendingSummary
+{
+    public int64 $count;
+    public string? $lowest;
+    public string? $highest;
+    public array<PendingConsumer> $consumers;
+}
+
+/**
+ * One pending entry: who holds it, for how long since its last delivery, and how often it was
+ * delivered.
+ */
+public struct PendingEntry
+{
+    public string $id;
+    public string $consumer;
+    public int64 $idleMillis;
+    public int64 $deliveries;
+}
+
+/**
+ * What `xautoclaim` took over, the id to go on from (`0-0` once done), and the ids it found
+ * deleted from the stream (Redis 7 and later).
+ */
+public struct AutoClaimed
+{
+    public string $next;
+    public array<StreamEntry> $entries;
+    public array<string> $deleted;
+}

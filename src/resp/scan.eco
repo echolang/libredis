@@ -1,0 +1,170 @@
+namespace redis::resp;
+
+/**
+ * An aggregate the scanner is inside: how many elements are still to come.
+ */
+internal struct Open
+{
+    internal uint64 $left;
+    // attributes annotate the value after them: finishing them finishes no element
+    internal bool $attribute;
+}
+
+/**
+ * Finds where one reply ends without building it, over bytes that arrive a read at a time. It
+ * keeps its place between calls: each `step` walks only what is new since the last.
+ */
+internal class Scanner
+{
+    /**
+     * How far the reply has been walked: once `step` says it is whole, its size.
+     */
+    internal usize $at;
+
+    /**
+     * When `step` says the reply is not whole yet: how many bytes it needs buffered before the
+     * next step can move on.
+     */
+    internal usize $want;
+
+    private array<Open> $open;
+
+    internal constructor()
+    {
+        $this->at = 0;
+        $this->want = 0;
+        $this->open = array<Open>();
+    }
+
+    /**
+     * Start over, for the next reply.
+     */
+    internal function reset() : void
+    {
+        $this->at = 0;
+        $this->want = 0;
+        $this->open->clear();
+    }
+
+    /**
+     * Walk on over `$bytes`, the reply's bytes so far from its first. True once it is whole;
+     * false when it needs `want` bytes first. A reply over `$max` bytes is `.tooLarge` as soon
+     * as its size shows.
+     */
+    internal function step(string::view $bytes, usize $max) : result<bool, redis::Error>
+    {
+        usize $size = $bytes->size;
+        while (true) {
+            if ($this->at >= $size) {
+                return $this->need($this->at + 1, $max);
+            }
+            uint8 $type = $bytes->byte($this->at);
+            usize $cr = lineEnd($bytes, $this->at + 1);
+            if ($cr + 1 >= $size) {
+                return $this->need($size + 1, $max);
+            }
+            if ($bytes->byte($cr + 1) != 10) {
+                return .error(.malformed('a line that does not end in CRLF'));
+            }
+            string::view $line = $bytes->sub($this->at + 1, $cr - $this->at - 1);
+            usize $next = $cr + 2;
+
+            if ($type == 36 || $type == 33 || $type == 61) {
+                // $, ! and =: a length, then that many bytes and a CRLF
+                int64 $len = guard redis::parseInt($line) else {
+                    return .error(.malformed('a bulk length that is not a number'));
+                }
+                if ($len == -1 && $type == 36) {
+                    $this->at = $next;
+                } else {
+                    if ($len < 0) {
+                        return .error(.malformed("a bulk length of {$len}"));
+                    }
+                    if ($len as uint64 > $max as uint64) {
+                        return .error(.tooLarge($len as uint64));
+                    }
+                    usize $end = $next + ($len as usize) + 2;
+                    if ($size < $end) {
+                        return $this->need($end, $max);
+                    }
+                    if ($bytes->byte($end - 2) != 13 || $bytes->byte($end - 1) != 10) {
+                        return .error(.malformed('a bulk string that does not end in CRLF'));
+                    }
+                    $this->at = $end;
+                }
+            } else if ($type == 42 || $type == 126 || $type == 62 || $type == 37 || $type == 124) {
+                // *, ~, >, % and |: a count of what follows
+                int64 $n = guard redis::parseInt($line) else {
+                    return .error(.malformed('an aggregate length that is not a number'));
+                }
+                $this->at = $next;
+                if ($n == -1 && $type == 42) {
+                    // a RESP2 nil array: a whole value
+                } else {
+                    if ($n < 0) {
+                        return .error(.malformed("an aggregate of {$n} elements"));
+                    }
+                    uint64 $elements = $n as uint64;
+                    if ($type == 37 || $type == 124) {
+                        $elements = $elements * 2;
+                    }
+                    if ($elements > ($max / MIN_ELEMENT) as uint64) {
+                        return .error(.tooLarge($elements * (MIN_ELEMENT as uint64)));
+                    }
+                    if ($elements > 0) {
+                        if ($this->open->count() >= MAX_DEPTH) {
+                            return .error(.malformed('replies nested too deep'));
+                        }
+                        $this->open->push(Open($elements, $type == 124));
+                        continue;
+                    }
+                    if ($type == 124) {
+                        // no attributes after all: the value is still to come
+                        continue;
+                    }
+                }
+            } else if ($type == 43 || $type == 45 || $type == 58 || $type == 95 || $type == 44 || $type == 35 || $type == 40) {
+                $this->at = $next;
+            } else {
+                return .error(.malformed("unknown type byte {$type}"));
+            }
+
+            // a value ended at $at: it may end the aggregates around it too
+            if ($this->ended()) {
+                return .ok(true);
+            }
+        }
+    }
+
+    /**
+     * Count the value that just ended against the aggregates it is in. True when that was the
+     * last of the reply.
+     */
+    private function ended() : bool
+    {
+        while (!$this->open->empty()) {
+            usize $top = $this->open->count() - 1;
+            uint64 $left = $this->open[$top]->left - 1;
+            if ($left > 0) {
+                $this->open[$top]->left = $left;
+                return false;
+            }
+            bool $attribute = $this->open[$top]->attribute;
+            $this->open->pop();
+            if ($attribute) {
+                // the value the attributes annotate has not come yet
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function need(usize $bytes, usize $max) : result<bool, redis::Error>
+    {
+        if ($bytes > $max) {
+            return .error(.tooLarge($bytes as uint64));
+        }
+        $this->want = $bytes;
+        return .ok(false);
+    }
+}

@@ -1,0 +1,647 @@
+/**
+ * Whole conversations with a scripted server: logins old and new, replies that arrive in pieces,
+ * pushes between replies, deadlines, connections that break, transactions, Pub/Sub and a pool.
+ */
+
+use std::thread;
+use std::time;
+use ecotest::expect;
+
+test login_sends_hello_with_credentials_name_and_select_in_one_write
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->expect('HELLO 3 AUTH app secret SETNAME worker');
+        $w->expect('SELECT 2');
+        $w->send(helloMap(42));
+        $w->send("+OK\r\n");
+        $w->expect('GET k');
+        $w->send("$1\r\nv\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->username = 'app';
+    $o->password = 'secret';
+    $o->clientName = 'worker';
+    $o->database = 2;
+    redis::Connection $r = login($o);
+    expect($r->version)->is('7.2.4');
+    expect($r->id)->is(42);
+    expect($r->mode)->is('standalone');
+    assert($r->protocol == redis::Protocol::resp3);
+    assert((expect($r->get('k'))->ok() ?? '') == 'v');
+    $f->server->join();
+}
+
+test a_password_alone_logs_in_as_the_default_user
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->expect('HELLO 3 AUTH default pw');
+        $w->send(helloMap(1));
+    });
+    redis::Options $o = optionsFor($f);
+    $o->password = 'pw';
+    redis::Connection $r = login($o);
+    $f->server->join();
+}
+
+test a_server_without_hello_gets_auth_and_speaks_resp2
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->expect('HELLO 3 AUTH default pw SETNAME n');
+        $w->expect('SELECT 1');
+        $w->send("-ERR unknown command 'HELLO', with args beginning with: '3' \r\n");
+        $w->send("-NOAUTH Authentication required.\r\n");
+        $w->expect('AUTH pw');
+        $w->expect('CLIENT SETNAME n');
+        $w->expect('SELECT 1');
+        $w->send("+OK\r\n+OK\r\n+OK\r\n");
+        $w->expect('HGETALL h');
+        $w->send("*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->password = 'pw';
+    $o->clientName = 'n';
+    $o->database = 1;
+    redis::Connection $r = login($o);
+    assert($r->protocol == redis::Protocol::resp2);
+    assert($r->version == '');
+    assert(expect($r->hGetAll('h'))->ok()['a'] == '1');
+    $f->server->join();
+}
+
+test a_refused_login_is_the_servers_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->expect('HELLO 3 AUTH app wrong');
+        $w->send("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->username = 'app';
+    $o->password = 'wrong';
+    redis::Error $e = expect(redis::Connection::open($o))->fails();
+    assert($e->is('WRONGPASS'));
+    assert($e->message() == 'WRONGPASS invalid username-password pair or user is disabled.');
+    $f->server->join();
+}
+
+test a_refused_select_fails_the_login
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->expect('HELLO 3');
+        $w->expect('SELECT 99');
+        $w->send(helloMap(1));
+        $w->send("-ERR DB index is out of range\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->database = 99;
+    assert(expect(redis::Connection::open($o))->fails()->message()->contains('out of range'));
+    $f->server->join();
+}
+
+test resp2_asks_hello_2_and_reads_its_flat_answer
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->expect('HELLO 2');
+        $w->send("*6\r\n$7\r\nversion\r\n$5\r\n6.2.6\r\n$5\r\nproto\r\n:2\r\n$2\r\nid\r\n:9\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->protocol = redis::Protocol::resp2;
+    redis::Connection $r = login($o);
+    expect($r->version)->is('6.2.6');
+    expect($r->id)->is(9);
+    expect($r->protocol == redis::Protocol::resp2)->yes(says: 'the protocol RESP2');
+    $f->server->join();
+}
+
+test a_unix_socket_works_like_tcp
+{
+    int32 $pid = std::env::pid();
+    string $path = "/tmp/libredis-test-{$pid}.sock";
+    Fake $f = fakeUnix($path, function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('PING');
+        $w->send("+PONG\r\n");
+    });
+    redis::Options $o = redis::Options();
+    $o->socket = $path;
+    redis::Connection $r = login($o);
+    expect($r->ping())->fine();
+    $f->server->join();
+}
+
+test replies_that_arrive_a_byte_at_a_time_read_the_same
+{
+    string $big = str::repeat('x', 70000);
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('LRANGE l 0 -1');
+        $w->trickle("*3\r\n$5\r\nhello\r\n:42\r\n%1\r\n+k\r\n_\r\n", 1);
+        $w->expect('GET big');
+        string $reply = "$70000\r\n";
+        $reply->append(str::repeat('x', 70000));
+        $reply->append("\r\n");
+        $w->trickle($reply, 4096);
+        $w->expect('PING');
+        // two replies in one write, the second cut in half
+        $w->send("+PONG\r\n$3\r\nab");
+        $w->expect('GET k');
+        $w->send("c\r\n");
+    });
+    redis::Connection $r = login($f);
+    redis::Reply $l = expect($r->call(['LRANGE', 'l', '0', '-1']))->ok();
+    assert(str::from($l) == '["hello", 42, {k: nil}]');
+    assert((expect($r->get('big'))->ok() ?? '') == $big);
+    expect($r->ping())->fine();
+    assert((expect($r->get('k'))->ok() ?? '') == 'abc');
+    $f->server->join();
+}
+
+test commands_that_make_a_listener_are_refused_on_a_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('PING');
+        $w->send("+PONG\r\n");
+    });
+    redis::Connection $r = login($f);
+    assert(expect($r->call(['subscribe', 'news']))->fails()->message()->contains('Subscriber'));
+    assert(expect($r->call(['MONITOR']))->fails()->name() == 'invalid');
+    expect($r->ping())->fine();
+    $f->server->join();
+}
+
+test pushes_between_replies_go_to_the_hook_not_to_the_caller
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send(">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    });
+    redis::Connection $r = login($f);
+    Tally $seen = Tally();
+    $r->onPush(function(redis::Reply $p) : void {
+        $seen->bump();
+    });
+    assert((expect($r->get('k'))->ok() ?? '') == 'v');
+    assert($seen->get() == 1);
+    $f->server->join();
+}
+
+test a_deadline_passing_mid_reply_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send("$5\r\nhe");
+        time::sleep(time::duration::millis(300));
+    });
+    redis::Connection $r = login($f);
+    redis::Error $e = expect($r->get('k', by: tcp::Deadline(ms: 100)))->fails();
+    assert($e->name() == 'timeout');
+    assert(!$r->alive());
+    assert(expect($r->get('k'))->fails()->name() == 'closed');
+    $f->server->join();
+}
+
+test the_options_timeout_applies_when_a_call_names_none
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        time::sleep(time::duration::millis(300));
+    });
+    redis::Options $o = optionsFor($f);
+    $o->timeout = time::duration::millis(100);
+    redis::Connection $r = login($o);
+    assert(expect($r->get('k'))->fails()->name() == 'timeout');
+    $f->server->join();
+}
+
+test a_server_that_hangs_up_mid_reply_is_a_transport_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send("$10\r\nshort");
+        $w->close();
+    });
+    redis::Connection $r = login($f);
+    redis::Error $e = expect($r->get('k'))->fails();
+    assert($e->name() == 'transport');
+    assert(!$r->alive());
+    $f->server->join();
+}
+
+test a_malformed_reply_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send("?what\r\n");
+    });
+    redis::Connection $r = login($f);
+    assert(expect($r->get('k'))->fails()->name() == 'malformed');
+    assert(!$r->alive());
+    $f->server->join();
+}
+
+test a_reply_over_max_reply_is_refused_before_it_is_read
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send("$5000\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->maxReply = 4096;
+    redis::Connection $r = login($o);
+    redis::Error $e = expect($r->get('k'))->fails();
+    assert($e->name() == 'tooLarge');
+    assert(!$r->alive());
+    $f->server->join();
+}
+
+test a_blocking_command_waits_its_timeout_on_top_of_the_options_one
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('BLPOP q 0.3');
+        time::sleep(time::duration::millis(250));
+        $w->send("*2\r\n$1\r\nq\r\n$1\r\nx\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->timeout = time::duration::millis(100);
+    redis::Connection $r = login($o);
+    redis::KeyedValue? $kv = expect($r->blPop(['q'], time::duration::millis(300)))->ok();
+    assert(($kv?->value ?? '') == 'x');
+    $f->server->join();
+}
+
+test a_pipeline_goes_out_in_one_write_and_fails_whole_when_the_connection_breaks
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('INCR a');
+        $w->expect('GET b');
+        $w->send(":1\r\n$1\r\nb\r\n");
+        $w->expect('INCR a');
+        $w->expect('INCR a');
+        $w->send(":2\r\n");
+        $w->close();
+    });
+    redis::Connection $r = login($f);
+    redis::Pipeline $p = $r->pipeline();
+    redis::Deferred<int64> $a = $p->incr('a');
+    redis::Deferred<string?> $b = $p->get('b');
+    expect($p->run())->fine();
+    expect($a->value())->ok(1);
+    expect(expect($b->value())->ok())->some('b');
+    redis::Deferred<int64> $c = $p->incr('a');
+    redis::Deferred<int64> $d = $p->incr('a');
+    redis::Error $e = expect($p->run())->fails();
+    assert($e->name() == 'transport');
+    assert(expect($c->value())->fails()->name() == 'transport');
+    assert(expect($d->value())->fails()->name() == 'transport');
+    $f->server->join();
+}
+
+test a_transaction_reads_queued_then_exec
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('MULTI');
+        $w->expect('INCR a');
+        $w->expect('GET b');
+        $w->expect('EXEC');
+        $w->send("+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:1\r\n-WRONGTYPE nope\r\n");
+        // refused while queueing
+        $w->expect('MULTI');
+        $w->expect('INCR a');
+        $w->expect('NOPE');
+        $w->expect('EXEC');
+        $w->send("+OK\r\n+QUEUED\r\n-ERR unknown command 'NOPE'\r\n-EXECABORT Transaction discarded because of previous errors.\r\n");
+        // a watched key changed
+        $w->expect('WATCH a');
+        $w->send("+OK\r\n");
+        $w->expect('MULTI');
+        $w->expect('INCR a');
+        $w->expect('EXEC');
+        $w->send("+OK\r\n+QUEUED\r\n*-1\r\n");
+    });
+    redis::Connection $r = login($f);
+    redis::Transaction $tx = $r->multi();
+    redis::Deferred<int64> $a = $tx->incr('a');
+    redis::Deferred<string?> $b = $tx->get('b');
+    expect($tx->exec())->fine();
+    assert(expect($a->value())->ok() == 1);
+    assert(expect($b->value())->fails()->is('WRONGTYPE'));
+
+    redis::Transaction $bad = $r->multi();
+    redis::Deferred<int64> $x = $bad->incr('a');
+    $bad->add(['NOPE']);
+    redis::Error $abort = expect($bad->exec())->fails();
+    assert($abort->is('EXECABORT'));
+    assert($abort->message()->contains("unknown command 'NOPE'"));
+    assert(expect($x->value())->fails()->is('EXECABORT'));
+
+    expect($r->watch(['a']))->fine();
+    assert($r->watching);
+    redis::Transaction $lost = $r->multi();
+    $lost->incr('a');
+    assert(expect($lost->exec())->fails()->name() == 'aborted');
+    assert(!$r->watching);
+    $f->server->join();
+}
+
+test optimistic_runs_again_when_exec_is_aborted_and_gives_up_after_its_attempts
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        int32 $round = 0;
+        while ($round < 2) {
+            $w->expect('WATCH k');
+            $w->send("+OK\r\n");
+            $w->expect('MULTI');
+            $w->expect('SET k v');
+            $w->expect('EXEC');
+            $w->send("+OK\r\n+QUEUED\r\n*-1\r\n");
+            $round++;
+        }
+        $w->expect('WATCH k');
+        $w->send("+OK\r\n");
+        $w->expect('UNWATCH');
+        $w->send("+OK\r\n");
+    });
+    redis::Connection $r = login($f);
+    Tally $runs = Tally();
+    redis::Error $e = expect($r->optimistic(['k'], function(redis::Connection $c, redis::Transaction $t) : status<redis::Error> {
+        $runs->bump();
+        $t->set('k', 'v');
+        return .ok;
+    }, 2))->fails();
+    assert($e->name() == 'aborted');
+    assert($runs->get() == 2);
+    // an error from the work stops it and lets go of the keys
+    redis::Error $stop = expect($r->optimistic(['k'], function(redis::Connection $c, redis::Transaction $t) : status<redis::Error> {
+        return .error(.invalid('changed my mind'));
+    }))->fails();
+    assert($stop->message() == 'changed my mind');
+    $f->server->join();
+}
+
+test reset_logs_in_again_after_reset
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('RESET');
+        $w->send("+RESET\r\n");
+        $w->expect('HELLO 3 AUTH default pw');
+        $w->send(helloMap(2));
+    });
+    redis::Options $o = optionsFor($f);
+    $o->password = 'pw';
+    redis::Options $first = $o;
+    redis::Connection $r = login($first);
+    expect($r->reset())->fine();
+    $f->server->join();
+}
+
+test reset_before_6_2_discards_unwatches_and_selects
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('RESET');
+        $w->send("-ERR unknown command 'RESET'\r\n");
+        $w->expect('DISCARD');
+        $w->send("-ERR DISCARD without MULTI\r\n");
+        $w->expect('UNWATCH');
+        $w->send("+OK\r\n");
+        $w->expect('SELECT 0');
+        $w->send("+OK\r\n");
+    });
+    redis::Connection $r = login($f);
+    expect($r->reset())->fine();
+    $f->server->join();
+}
+
+test a_subscriber_keeps_messages_that_come_before_its_confirmations
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('SUBSCRIBE a b');
+        $w->send(">3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n");
+        // a message for a, before b is confirmed
+        $w->send(">3\r\n$7\r\nmessage\r\n$1\r\na\r\n$5\r\nearly\r\n");
+        $w->send(">3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n");
+        $w->expect('PSUBSCRIBE n.*');
+        $w->send(">3\r\n$10\r\npsubscribe\r\n$3\r\nn.*\r\n:3\r\n");
+        $w->send(">4\r\n$8\r\npmessage\r\n$3\r\nn.*\r\n$3\r\nn.x\r\n$4\r\nlate\r\n");
+        $w->expect('PING');
+        $w->send(">3\r\n$7\r\nmessage\r\n$1\r\nb\r\n$3\r\nmid\r\n+PONG\r\n");
+        $w->expect('SSUBSCRIBE s');
+        $w->send(">3\r\n$10\r\nssubscribe\r\n$1\r\ns\r\n:1\r\n");
+        // the slot of s moved: the server lets go of it by itself
+        $w->send(">3\r\n$12\r\nsunsubscribe\r\n$1\r\ns\r\n:0\r\n");
+        $w->send(">3\r\n$8\r\nsmessage\r\n$1\r\nt\r\n$3\r\nend\r\n");
+        $w->expect('UNSUBSCRIBE');
+        $w->send(">3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:1\r\n>3\r\n$11\r\nunsubscribe\r\n$1\r\nb\r\n:0\r\n");
+        $w->expect('SUBSCRIBE z');
+        $w->send("-NOPERM this user has no permissions to access the 'z' channel\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    redis::Subscriber $s = expect(redis::Subscriber::open($o))->ok();
+    expect($s->subscribe(['a', 'b']))->fine();
+    expect($s->psubscribe(['n.*']))->fine();
+    expect($s->ping())->fine();
+    redis::Message $m1 = guard expect($s->next(by: tcp::Deadline(ms: 1000)))->ok() else {
+        die('no early message');
+    }
+    expect($m1->channel)->is('a');
+    expect($m1->payload)->is('early');
+    redis::Message $m2 = guard expect($s->next(by: tcp::Deadline(ms: 1000)))->ok() else {
+        die('no pattern message');
+    }
+    expect($m2->kind == redis::MessageKind::pattern)->yes(says: 'a pattern message');
+    expect($m2->pattern)->is('n.*');
+    expect($m2->channel)->is('n.x');
+    redis::Message $m3 = guard expect($s->next(by: tcp::Deadline(ms: 1000)))->ok() else {
+        die('no message from around the ping');
+    }
+    assert($m3->payload == 'mid');
+    expect($s->ssubscribe(['s']))->fine();
+    assert($s->count() == 4);
+    redis::Message $m4 = guard expect($s->next(by: tcp::Deadline(ms: 1000)))->ok() else {
+        die('no shard message');
+    }
+    expect($m4->kind == redis::MessageKind::shard)->yes(says: 'a shard message');
+    expect($m4->payload)->is('end');
+    assert($s->count() == 3);
+    // nothing more: null, and the connection stays
+    assert(expect($s->next(by: tcp::Deadline(ms: 50)))->ok() == null);
+    assert($s->alive());
+    expect($s->unsubscribe())->fine();
+    assert($s->count() == 1);
+    assert(expect($s->subscribe(['z']))->fails()->is('NOPERM'));
+    $f->server->join();
+}
+
+test a_subscriber_waiting_through_half_a_message_keeps_it
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('SUBSCRIBE a');
+        $w->send(">3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n");
+        $w->send(">3\r\n$7\r\nmessage\r\n$1\r\na\r\n$4\r\nha");
+        time::sleep(time::duration::millis(200));
+        $w->send("lf\r\n");
+    });
+    redis::Subscriber $s = expect(redis::Subscriber::open(optionsFor($f)))->ok();
+    expect($s->subscribe(['a']))->fine();
+    assert(expect($s->next(by: tcp::Deadline(ms: 50)))->ok() == null);
+    assert($s->alive());
+    redis::Message $m = guard expect($s->next(by: tcp::Deadline(ms: 2000)))->ok() else {
+        die('the message never completed');
+    }
+    assert($m->payload == 'half');
+    $f->server->join();
+}
+
+test a_lease_given_back_while_watching_lets_go_of_the_keys
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('WATCH k');
+        $w->send("+OK\r\n");
+        $w->expect('SELECT 3');
+        $w->send("+OK\r\n");
+        $w->expect('UNWATCH');
+        $w->send("+OK\r\n");
+        $w->expect('SELECT 0');
+        $w->send("+OK\r\n");
+        $w->expect('GET k');
+        $w->send("$1\r\nv\r\n");
+    });
+    redis::PoolOptions $limits = redis::PoolOptions();
+    $limits->max = 1;
+    redis::Pool $pool = redis::Pool(optionsFor($f), $limits);
+    redis::Lease $l = expect($pool->acquire())->ok();
+    expect($l->db()->watch(['k']))->fine();
+    expect($l->db()->select(3))->fine();
+    $l->release();
+    $l->release();
+    assert($pool->idle() == 1);
+    assert((expect($pool->get('k'))->ok() ?? '') == 'v');
+    assert($pool->open() == 1);
+    $f->server->join();
+}
+
+test a_pool_waits_for_a_connection_and_gives_up_at_the_deadline
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('PING');
+        $w->send("+PONG\r\n");
+    });
+    redis::PoolOptions $limits = redis::PoolOptions();
+    $limits->max = 1;
+    redis::Pool $pool = redis::Pool(optionsFor($f), $limits);
+    redis::Lease $held = expect($pool->acquire())->ok();
+    redis::Error $e = expect($pool->acquire(by: tcp::Deadline(ms: 100)))->fails();
+    assert($e->name() == 'exhausted');
+    expect($held->db()->ping())->fine();
+    $held->release();
+    $pool->close();
+    assert(expect($pool->acquire())->fails()->name() == 'closed');
+    $f->server->join();
+}
+
+test two_blocking_commands_in_a_pipeline_get_both_waits
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('BLPOP a 0.3');
+        $w->expect('BLPOP b 0.3');
+        // the server runs them one after the other: the second answer comes after both waits
+        time::sleep(time::duration::millis(280));
+        $w->send("*2\r\n$1\r\na\r\n$1\r\nx\r\n");
+        time::sleep(time::duration::millis(280));
+        $w->send("*2\r\n$1\r\nb\r\n$1\r\ny\r\n");
+    });
+    redis::Options $o = optionsFor($f);
+    $o->timeout = time::duration::millis(100);
+    redis::Connection $r = login($o);
+    redis::Pipeline $p = $r->pipeline();
+    redis::Deferred<redis::KeyedValue?> $first = $p->blPop(['a'], time::duration::millis(300));
+    redis::Deferred<redis::KeyedValue?> $second = $p->blPop(['b'], time::duration::millis(300));
+    expect($p->run())->fine();
+    assert((expect($second->value())->ok()?->value ?? '') == 'y');
+    $f->server->join();
+}
+
+test a_raw_select_is_reset_before_the_connection_is_lent_again
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('select 5');
+        $w->send("+OK\r\n");
+        $w->expect('RESET');
+        $w->send("+RESET\r\n");
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send("$1\r\nv\r\n");
+    });
+    redis::PoolOptions $limits = redis::PoolOptions();
+    $limits->max = 1;
+    redis::Pool $pool = redis::Pool(optionsFor($f), $limits);
+    expect($pool->call(['select', '5']))->ok();
+    // the next borrower reads database 0, not the 5 a raw command left behind
+    assert((expect($pool->get('k'))->ok() ?? '') == 'v');
+    assert($pool->open() == 1);
+    $f->server->join();
+}
+
+test listeners_are_refused_through_a_pool_and_a_pipeline_too
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('PING');
+        $w->send("+PONG\r\n");
+    });
+    redis::PoolOptions $limits = redis::PoolOptions();
+    $limits->max = 1;
+    redis::Pool $pool = redis::Pool(optionsFor($f), $limits);
+    assert(expect($pool->call(['SUBSCRIBE', 'news']))->fails()->name() == 'invalid');
+    assert(expect($pool->call(redis::Command(['psubscribe', 'n*'])))->fails()->name() == 'invalid');
+    redis::Pipeline $p = $pool->pipeline();
+    redis::Deferred<redis::Reply> $m = $p->add(['MONITOR']);
+    assert(expect($p->run())->fails()->name() == 'invalid');
+    // nothing was sent: the connection still answers
+    expect($pool->ping())->fine();
+    $f->server->join();
+}
+
+test on_push_does_not_outlive_the_lease
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect('GET k');
+        $w->send(">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        $w->expect('GET k');
+        $w->send(">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    });
+    redis::PoolOptions $limits = redis::PoolOptions();
+    $limits->max = 1;
+    redis::Pool $pool = redis::Pool(optionsFor($f), $limits);
+    Tally $seen = Tally();
+    redis::Lease $l = expect($pool->acquire())->ok();
+    $l->db()->onPush(function(redis::Reply $p) : void {
+        $seen->bump();
+    });
+    assert((expect($l->db()->get('k'))->ok() ?? '') == 'v');
+    $l->release();
+    assert($seen->get() == 1);
+    // the same connection, lent again: the first borrower's hook is gone
+    assert((expect($pool->get('k'))->ok() ?? '') == 'v');
+    assert($seen->get() == 1);
+    $f->server->join();
+}
+

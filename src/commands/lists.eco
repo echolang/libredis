@@ -1,0 +1,495 @@
+/**
+ * The typed commands for lists: queues and stacks of strings, blocking pops included: how each is written (`ListCommands`), and the methods that
+ * run them on connections, pools and clusters (`Lists`) or queue them on pipelines and
+ * transactions (`QueuedLists`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct ListCommands
+{
+    internal static function lPush(const string& $key, const array<string>& $values) : Command
+    {
+        Command $c = Command('LPUSH');
+        $c->key($key);
+        $c->args($values);
+        return $c;
+    }
+
+    internal static function rPush(const string& $key, const array<string>& $values) : Command
+    {
+        Command $c = Command('RPUSH');
+        $c->key($key);
+        $c->args($values);
+        return $c;
+    }
+
+    internal static function lPop(const string& $key) : Command
+    {
+        Command $c = Command('LPOP');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function lPopCount(const string& $key, uint32 $count) : Command
+    {
+        Command $c = Command('LPOP');
+        $c->key($key);
+        $c->arg($count as int64);
+        return $c;
+    }
+
+    internal static function rPop(const string& $key) : Command
+    {
+        Command $c = Command('RPOP');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function rPopCount(const string& $key, uint32 $count) : Command
+    {
+        Command $c = Command('RPOP');
+        $c->key($key);
+        $c->arg($count as int64);
+        return $c;
+    }
+
+    internal static function lRange(const string& $key, int64 $start, int64 $stop) : Command
+    {
+        Command $c = Command('LRANGE');
+        $c->key($key);
+        $c->arg($start);
+        $c->arg($stop);
+        return $c;
+    }
+
+    internal static function lLen(const string& $key) : Command
+    {
+        Command $c = Command('LLEN');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function lIndex(const string& $key, int64 $index) : Command
+    {
+        Command $c = Command('LINDEX');
+        $c->key($key);
+        $c->arg($index);
+        return $c;
+    }
+
+    internal static function lSet(const string& $key, int64 $index, const string& $value) : Command
+    {
+        Command $c = Command('LSET');
+        $c->key($key);
+        $c->arg($index);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function lRem(const string& $key, int64 $count, const string& $value) : Command
+    {
+        Command $c = Command('LREM');
+        $c->key($key);
+        $c->arg($count);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function lTrim(const string& $key, int64 $start, int64 $stop) : Command
+    {
+        Command $c = Command('LTRIM');
+        $c->key($key);
+        $c->arg($start);
+        $c->arg($stop);
+        return $c;
+    }
+
+    internal static function lInsert(const string& $key, Position $where, const string& $pivot, const string& $value) : Command
+    {
+        Command $c = Command('LINSERT');
+        $c->key($key);
+        $c->arg($where->word());
+        $c->arg($pivot);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function lMove(const string& $source, const string& $destination, Side $from, Side $to) : Command
+    {
+        Command $c = Command('LMOVE');
+        $c->key($source);
+        $c->key($destination);
+        $c->arg($from->word());
+        $c->arg($to->word());
+        return $c;
+    }
+
+    internal static function lPos(const string& $key, const string& $value) : Command
+    {
+        Command $c = Command('LPOS');
+        $c->key($key);
+        $c->arg($value);
+        return $c;
+    }
+
+    internal static function blPop(const array<string>& $keys, time::duration $timeout) : Command
+    {
+        Command $c = Command('BLPOP');
+        $c->keys($keys);
+        $c->timeoutArg($timeout);
+        return $c;
+    }
+
+    internal static function brPop(const array<string>& $keys, time::duration $timeout) : Command
+    {
+        Command $c = Command('BRPOP');
+        $c->keys($keys);
+        $c->timeoutArg($timeout);
+        return $c;
+    }
+
+    internal static function blMove(const string& $source, const string& $destination, Side $from, Side $to, time::duration $timeout) : Command
+    {
+        Command $c = Command('BLMOVE');
+        $c->key($source);
+        $c->key($destination);
+        $c->arg($from->word());
+        $c->arg($to->word());
+        $c->timeoutArg($timeout);
+        return $c;
+    }
+}
+
+/**
+ * The commands for lists: queues and stacks of strings, blocking pops included, each run as it is called and answered with its reply.
+ */
+public interface Lists
+{
+    /**
+     * Put `$values` at the head of the list at `$key`, one after another, and answer its new
+     * length.
+     */
+    function lPush(const string& $key, const array<string>& $values, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lPush($key, $values), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Put `$values` at the tail of the list at `$key`, in order, and answer its new length.
+     */
+    function rPush(const string& $key, const array<string>& $values, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ListCommands::rPush($key, $values), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Take the head of the list at `$key`, or null when it is empty.
+     */
+    function lPop(const string& $key, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lPop($key), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Take up to `$count` values off the head of the list at `$key`.
+     */
+    function lPop(const string& $key, count: uint32 $count, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lPopCount($key, $count), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * Take the tail of the list at `$key`, or null when it is empty.
+     */
+    function rPop(const string& $key, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::rPop($key), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Take up to `$count` values off the tail of the list at `$key`.
+     */
+    function rPop(const string& $key, count: uint32 $count, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(ListCommands::rPopCount($key, $count), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The values of the list at `$key` from `$start` to `$stop`, both included; -1 is the last.
+     */
+    function lRange(const string& $key, int64 $start, int64 $stop, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lRange($key, $start, $stop), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The length of the list at `$key`.
+     */
+    function lLen(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lLen($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The value at `$index` of the list at `$key`, or null past its end.
+     */
+    function lIndex(const string& $key, int64 $index, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lIndex($key, $index), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Set the value at `$index` of the list at `$key`.
+     */
+    function lSet(const string& $key, int64 $index, const string& $value, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ListCommands::lSet($key, $index, $value), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Remove `$count` values equal to `$value`: from the head when positive, the tail when
+     * negative, all with 0.
+     */
+    function lRem(const string& $key, int64 $count, const string& $value, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lRem($key, $count, $value), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Keep only the values from `$start` to `$stop` of the list at `$key`.
+     */
+    function lTrim(const string& $key, int64 $start, int64 $stop, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ListCommands::lTrim($key, $start, $stop), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Insert `$value` before or after the first `$pivot`, and answer the new length: -1 without the
+     * pivot, 0 without the list.
+     */
+    function lInsert(const string& $key, Position $where, const string& $pivot, const string& $value, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lInsert($key, $where, $pivot, $value), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Move one value from an end of `$source` to an end of `$destination`, and answer it. Null when
+     * `$source` is empty.
+     */
+    function lMove(const string& $source, const string& $destination, Side $from, Side $to, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lMove($source, $destination, $from, $to), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * The index of the first `$value` in the list at `$key`, or null.
+     */
+    function lPos(const string& $key, const string& $value, by: tcp::Deadline? $by = null) : result<int64?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::lPos($key, $value), by: $by);
+        return Decode::intOrNil($r);
+    }
+
+    /**
+     * Take the head of the first of `$keys` that has one, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function blPop(const array<string>& $keys, time::duration $timeout, by: tcp::Deadline? $by = null) : result<KeyedValue?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::blPop($keys, $timeout), by: $by);
+        return Decode::keyedValue($r);
+    }
+
+    /**
+     * Take the tail of the first of `$keys` that has one, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function brPop(const array<string>& $keys, time::duration $timeout, by: tcp::Deadline? $by = null) : result<KeyedValue?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::brPop($keys, $timeout), by: $by);
+        return Decode::keyedValue($r);
+    }
+
+    /**
+     * `lMove`, waiting up to `$timeout` for `$source` to have a value. Null when the wait ran out.
+     */
+    function blMove(const string& $source, const string& $destination, Side $from, Side $to, time::duration $timeout, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(ListCommands::blMove($source, $destination, $from, $to, $timeout), by: $by);
+        return Decode::text($r);
+    }
+}
+
+/**
+ * The commands for lists: queues and stacks of strings, blocking pops included, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedLists
+{
+    /**
+     * Put `$values` at the head of the list at `$key`, one after another, and answer its new
+     * length.
+     */
+    function lPush(const string& $key, const array<string>& $values) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ListCommands::lPush($key, $values)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Put `$values` at the tail of the list at `$key`, in order, and answer its new length.
+     */
+    function rPush(const string& $key, const array<string>& $values) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ListCommands::rPush($key, $values)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Take the head of the list at `$key`, or null when it is empty.
+     */
+    function lPop(const string& $key) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(ListCommands::lPop($key)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Take up to `$count` values off the head of the list at `$key`.
+     */
+    function lPop(const string& $key, count: uint32 $count) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(ListCommands::lPopCount($key, $count)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * Take the tail of the list at `$key`, or null when it is empty.
+     */
+    function rPop(const string& $key) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(ListCommands::rPop($key)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Take up to `$count` values off the tail of the list at `$key`.
+     */
+    function rPop(const string& $key, count: uint32 $count) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(ListCommands::rPopCount($key, $count)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The values of the list at `$key` from `$start` to `$stop`, both included; -1 is the last.
+     */
+    function lRange(const string& $key, int64 $start, int64 $stop) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(ListCommands::lRange($key, $start, $stop)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The length of the list at `$key`.
+     */
+    function lLen(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ListCommands::lLen($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The value at `$index` of the list at `$key`, or null past its end.
+     */
+    function lIndex(const string& $key, int64 $index) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(ListCommands::lIndex($key, $index)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Set the value at `$index` of the list at `$key`.
+     */
+    function lSet(const string& $key, int64 $index, const string& $value) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ListCommands::lSet($key, $index, $value)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Remove `$count` values equal to `$value`: from the head when positive, the tail when
+     * negative, all with 0.
+     */
+    function lRem(const string& $key, int64 $count, const string& $value) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ListCommands::lRem($key, $count, $value)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Keep only the values from `$start` to `$stop` of the list at `$key`.
+     */
+    function lTrim(const string& $key, int64 $start, int64 $stop) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ListCommands::lTrim($key, $start, $stop)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Insert `$value` before or after the first `$pivot`, and answer the new length: -1 without the
+     * pivot, 0 without the list.
+     */
+    function lInsert(const string& $key, Position $where, const string& $pivot, const string& $value) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(ListCommands::lInsert($key, $where, $pivot, $value)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Move one value from an end of `$source` to an end of `$destination`, and answer it. Null when
+     * `$source` is empty.
+     */
+    function lMove(const string& $source, const string& $destination, Side $from, Side $to) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(ListCommands::lMove($source, $destination, $from, $to)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * The index of the first `$value` in the list at `$key`, or null.
+     */
+    function lPos(const string& $key, const string& $value) : Deferred<int64?>
+    {
+        return Deferred<int64?>($this->queue(ListCommands::lPos($key, $value)), (const Reply& $r) => Decode::intOrNil($r));
+    }
+
+    /**
+     * Take the head of the first of `$keys` that has one, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function blPop(const array<string>& $keys, time::duration $timeout) : Deferred<KeyedValue?>
+    {
+        return Deferred<KeyedValue?>($this->queue(ListCommands::blPop($keys, $timeout)), (const Reply& $r) => Decode::keyedValue($r));
+    }
+
+    /**
+     * Take the tail of the first of `$keys` that has one, waiting up to `$timeout` (zero waits
+     * forever). Null when the wait ran out.
+     */
+    function brPop(const array<string>& $keys, time::duration $timeout) : Deferred<KeyedValue?>
+    {
+        return Deferred<KeyedValue?>($this->queue(ListCommands::brPop($keys, $timeout)), (const Reply& $r) => Decode::keyedValue($r));
+    }
+
+    /**
+     * `lMove`, waiting up to `$timeout` for `$source` to have a value. Null when the wait ran out.
+     */
+    function blMove(const string& $source, const string& $destination, Side $from, Side $to, time::duration $timeout) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(ListCommands::blMove($source, $destination, $from, $to, $timeout)), (const Reply& $r) => Decode::text($r));
+    }
+}

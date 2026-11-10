@@ -1,0 +1,357 @@
+namespace redis;
+
+/**
+ * One entry of a map reply.
+ */
+public struct Pair
+{
+    public Reply $key;
+    public Reply $value;
+}
+
+/**
+ * A reply as the server sent it, any RESP2 or RESP3 type. The typed commands read these for you;
+ * `call` hands one over for everything else.
+ *
+ * ```echo
+ * redis::Reply $r = guard $db->call(['OBJECT', 'ENCODING', 'k']);
+ * echo $r->text() ?? '(nil)';     // embstr
+ * ```
+ */
+public enum Reply
+{
+    /**
+     * A status line: `OK`, `PONG`, `QUEUED`.
+     */
+    case simple(string $text);
+
+    /**
+     * An error reply, simple or bulk. A command that fails gives `Error::server` instead; this
+     * shows up inside replies that carry several, like EXEC's.
+     */
+    indirect case error(ServerError $error);
+
+    case int(int64 $value);
+
+    /**
+     * A bulk string: bytes, binary safe.
+     */
+    case bulk(string $data);
+
+    /**
+     * No value: a missing key, RESP3 null, RESP2's nil bulk string and nil array.
+     */
+    case nil;
+
+    /**
+     * A RESP3 double. RESP2 sends doubles as bulk strings, and `float()` reads both.
+     */
+    case double(float64 $value);
+
+    /**
+     * A RESP3 boolean. RESP2 sends 0 and 1, and `bool()` reads both.
+     */
+    case bool(bool $value);
+
+    /**
+     * A RESP3 big number, as its decimal digits.
+     */
+    case big(string $digits);
+
+    /**
+     * A RESP3 verbatim string: its three-letter format (`txt`, `mkd`) and the text.
+     */
+    indirect case verbatim(string $format, string $text);
+
+    indirect case array(array<Reply> $items);
+
+    /**
+     * A RESP3 map, in the order the server sent it. RESP2 sends maps as flat arrays, and `pairs()`
+     * reads both.
+     */
+    indirect case map(array<Pair> $pairs);
+
+    indirect case set(array<Reply> $items);
+
+    /**
+     * A RESP3 push: a Pub/Sub message or another out-of-band notice. Ordinary replies never are.
+     */
+    indirect case push(array<Reply> $items);
+
+    /**
+     * The bytes of a bulk, simple or verbatim string, or a big number's digits. Null for the
+     * other types, nil included.
+     */
+    public const function text() : string?
+    {
+        return match ($this) {
+            Reply::bulk($d) => $d,
+            Reply::simple($t) => $t,
+            Reply::verbatim($f, $t) => $t,
+            Reply::big($d) => $d,
+            else => null,
+        };
+    }
+
+    /**
+     * An integer reply, or a string that is one whole integer. Null otherwise.
+     */
+    public const function int() : int64?
+    {
+        match ($this) {
+            Reply::int($n) => {
+                return $n;
+            },
+            Reply::bool($b) => {
+                if ($b) {
+                    return 1;
+                }
+                return 0;
+            },
+            Reply::bulk($d) => {
+                return parseInt($d);
+            },
+            Reply::simple($t) => {
+                return parseInt($t);
+            },
+            Reply::big($d) => {
+                return parseInt($d);
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * A double, an integer, or a string that is a number (RESP2 sends scores as strings).
+     * `inf`, `-inf` and `nan` too.
+     */
+    public const function float() : float64?
+    {
+        match ($this) {
+            Reply::double($x) => {
+                return $x;
+            },
+            Reply::int($n) => {
+                return $n as float64;
+            },
+            Reply::bulk($d) => {
+                return parseFloat($d);
+            },
+            Reply::simple($t) => {
+                return parseFloat($t);
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * A boolean, or RESP2's integer 0 or 1.
+     */
+    public const function bool() : bool?
+    {
+        match ($this) {
+            Reply::bool($b) => {
+                return $b;
+            },
+            Reply::int($n) => {
+                if ($n == 1) {
+                    return true;
+                }
+                if ($n == 0) {
+                    return false;
+                }
+                return null;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * The elements of an array, set or push. Null for anything else, a map and nil included.
+     */
+    public const function items() : array<Reply>?
+    {
+        return match ($this) {
+            Reply::array($a) => $a,
+            Reply::set($s) => $s,
+            Reply::push($p) => $p,
+            else => null,
+        };
+    }
+
+    /**
+     * The entries of a map, or of an array of even length read two by two, which is how RESP2
+     * sends a map. Null for anything else.
+     */
+    public const function pairs() : array<Pair>?
+    {
+        match ($this) {
+            Reply::map($m) => {
+                return $m;
+            },
+            Reply::array($a) => {
+                if ($a->count() % 2 != 0) {
+                    return null;
+                }
+                array<Pair> $out = arr::room<Pair>($a->count() / 2);
+                usize $i = 0;
+                while ($i < $a->count()) {
+                    $out->push(Pair($a[$i], $a[$i + 1]));
+                    $i = $i + 2;
+                }
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * True for nil.
+     */
+    public const function isNil() : bool
+    {
+        return match ($this) {
+            Reply::nil => true,
+            else => false,
+        };
+    }
+
+    /**
+     * The error an error reply carries, or null.
+     */
+    public const function failure() : ServerError?
+    {
+        return match ($this) {
+            Reply::error($e) => $e,
+            else => null,
+        };
+    }
+
+    /**
+     * The type's name: `bulk`, `int`, `array` and so on. For a message or a test.
+     */
+    public const function kind() : string
+    {
+        return match ($this) {
+            Reply::simple($t) => 'simple',
+            Reply::error($e) => 'error',
+            Reply::int($n) => 'int',
+            Reply::bulk($d) => 'bulk',
+            Reply::nil => 'nil',
+            Reply::double($x) => 'double',
+            Reply::bool($b) => 'bool',
+            Reply::big($d) => 'big',
+            Reply::verbatim($f, $t) => 'verbatim',
+            Reply::array($a) => 'array',
+            Reply::map($m) => 'map',
+            Reply::set($s) => 'set',
+            Reply::push($p) => 'push',
+        };
+    }
+}
+
+/**
+ * `$text` as one whole decimal integer, or null. No spaces, no `+`.
+ */
+internal function parseInt(string::view $text) : int64?
+{
+    usize $n = $text->size;
+    if ($n == 0 || $n > 20) {
+        return null;
+    }
+    usize $i = 0;
+    bool $negative = false;
+    if ($text->byte(0) == 45) {
+        $negative = true;
+        $i = 1;
+        if ($n == 1) {
+            return null;
+        }
+    }
+    uint64 $v = 0;
+    while ($i < $n) {
+        uint8 $c = $text->byte($i);
+        if ($c < 48 || $c > 57) {
+            return null;
+        }
+        uint64 $d = ($c - 48) as uint64;
+        if ($v > (18446744073709551615 - $d) / 10) {
+            return null;
+        }
+        $v = $v * 10 + $d;
+        $i = $i + 1;
+    }
+    if ($negative) {
+        if ($v > 9223372036854775808) {
+            return null;
+        }
+        if ($v == 9223372036854775808) {
+            return -9223372036854775807 - 1;
+        }
+        return -($v as int64);
+    }
+    if ($v > 9223372036854775807) {
+        return null;
+    }
+    return $v as int64;
+}
+
+/**
+ * `$text` as a float: what Redis writes for scores and doubles, `inf`, `-inf` and `nan`
+ * included. Null when it is not one.
+ */
+internal function parseFloat(string::view $text) : float64?
+{
+    string $t = string($text);
+    // a number ends in a digit; only the spelled-out ones need comparing
+    if ($text->size > 0 && $text->byte($text->size - 1) >= 48 && $text->byte($text->size - 1) <= 57) {
+        return str::float($t);
+    }
+    if ($t == 'inf' || $t == '+inf' || $t == 'Infinity' || $t == '+Infinity') {
+        return mem::bit_cast<float64, uint64>(9218868437227405312);
+    }
+    if ($t == '-inf' || $t == '-Infinity') {
+        return mem::bit_cast<float64, uint64>(18442240474082181120);
+    }
+    if ($t == 'nan' || $t == '-nan' || $t == 'NaN') {
+        return mem::bit_cast<float64, uint64>(9221120237041090560);
+    }
+    return str::float($t);
+}
+
+/**
+ * A float as Redis reads it back exactly: `inf`, `-inf`, or 17 significant digits.
+ */
+internal function floatArg(float64 $f) : string
+{
+    // from the bits: float comparisons are not IEEE about NaN here
+    uint64 $bits = mem::bit_cast<uint64, float64>($f);
+    if ((($bits >> 52) & 2047) == 2047) {
+        if (($bits & 4503599627370495) != 0) {
+            return 'nan';
+        }
+        if (($bits >> 63) != 0) {
+            return '-inf';
+        }
+        return 'inf';
+    }
+    // whole numbers in range print without an exponent, the way people write scores
+    if ($f < 1000000000000000.0 && $f > -1000000000000000.0 && (($f as int64) as float64) == $f) {
+        int64 $whole = $f as int64;
+        return "{$whole}";
+    }
+    // the shortest of 15 or 17 digits that reads back as the same double
+    string $short = "{$f:.15g}";
+    if ((str::float($short) ?? 0.0) == $f) {
+        return $short;
+    }
+    return "{$f:.17g}";
+}

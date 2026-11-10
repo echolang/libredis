@@ -1,0 +1,437 @@
+/**
+ * The typed commands for keys of any type: deleting, expiring, renaming, scanning: how each is written (`KeyCommands`), and the methods that
+ * run them on connections, pools and clusters (`Keys`) or queue them on pipelines and
+ * transactions (`QueuedKeys`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct KeyCommands
+{
+    internal static function del(const array<string>& $keys) : Command
+    {
+        Command $c = Command('DEL');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function unlink(const array<string>& $keys) : Command
+    {
+        Command $c = Command('UNLINK');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function exists(const array<string>& $keys) : Command
+    {
+        Command $c = Command('EXISTS');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function expire(const string& $key, time::duration $ttl, Condition? $condition) : Command
+    {
+        Command $c = Command('PEXPIRE');
+        $c->key($key);
+        $c->arg($ttl->as_millis());
+        if ($condition != null) {
+            Condition $w = guard $condition;
+            $c->arg($w->word());
+        }
+        return $c;
+    }
+
+    internal static function expireAt(const string& $key, int64 $unixMillis, Condition? $condition) : Command
+    {
+        Command $c = Command('PEXPIREAT');
+        $c->key($key);
+        $c->arg($unixMillis);
+        if ($condition != null) {
+            Condition $w = guard $condition;
+            $c->arg($w->word());
+        }
+        return $c;
+    }
+
+    internal static function ttl(const string& $key) : Command
+    {
+        Command $c = Command('TTL');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function pttl(const string& $key) : Command
+    {
+        Command $c = Command('PTTL');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function persist(const string& $key) : Command
+    {
+        Command $c = Command('PERSIST');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function type(const string& $key) : Command
+    {
+        Command $c = Command('TYPE');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function rename(const string& $key, const string& $newKey) : Command
+    {
+        Command $c = Command('RENAME');
+        $c->key($key);
+        $c->key($newKey);
+        return $c;
+    }
+
+    internal static function renameNx(const string& $key, const string& $newKey) : Command
+    {
+        Command $c = Command('RENAMENX');
+        $c->key($key);
+        $c->key($newKey);
+        return $c;
+    }
+
+    internal static function copy(const string& $source, const string& $destination, bool $replace) : Command
+    {
+        Command $c = Command('COPY');
+        $c->key($source);
+        $c->key($destination);
+        if ($replace) {
+            $c->arg('REPLACE');
+        }
+        return $c;
+    }
+
+    internal static function touch(const array<string>& $keys) : Command
+    {
+        Command $c = Command('TOUCH');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function randomKey() : Command
+    {
+        Command $c = Command('RANDOMKEY');
+        return $c;
+    }
+
+    internal static function keys(const string& $pattern) : Command
+    {
+        Command $c = Command('KEYS');
+        $c->arg($pattern);
+        return $c;
+    }
+
+    internal static function scan(const string& $cursor, ScanOptions $options) : Command
+    {
+        Command $c = Command('SCAN');
+        $c->arg($cursor);
+        $options->into($c);
+        return $c;
+    }
+}
+
+/**
+ * The commands for keys of any type: deleting, expiring, renaming, scanning, each run as it is called and answered with its reply.
+ */
+public interface Keys
+{
+    /**
+     * Delete `$keys`, and answer how many there were.
+     */
+    function del(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::del($keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Delete `$keys`, freeing their memory in the background, and answer how many there were.
+     */
+    function unlink(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::unlink($keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * How many of `$keys` exist. A key named twice counts twice.
+     */
+    function exists(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::exists($keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Expire `$key` after `$ttl`, to the millisecond. False when there is no such key, or
+     * `$condition` stopped it.
+     */
+    function expire(const string& $key, time::duration $ttl, Condition? $condition = null, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::expire($key, $ttl, $condition), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * Expire `$key` at a Unix time in milliseconds. False when there is no such key, or
+     * `$condition` stopped it.
+     */
+    function expireAt(const string& $key, int64 $unixMillis, Condition? $condition = null, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::expireAt($key, $unixMillis, $condition), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * The seconds `$key` has left: -1 when it does not expire, -2 when there is no such key.
+     */
+    function ttl(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::ttl($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The milliseconds `$key` has left: -1 when it does not expire, -2 when there is no such key.
+     */
+    function pttl(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::pttl($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Take the expiry off `$key`. False when it had none, or there is no such key.
+     */
+    function persist(const string& $key, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::persist($key), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * The type of the value at `$key`: `string`, `list`, `set`, `zset`, `hash`, `stream`, or
+     * `none`.
+     */
+    function type(const string& $key, by: tcp::Deadline? $by = null) : result<string, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::type($key), by: $by);
+        return Decode::bytes($r);
+    }
+
+    /**
+     * Rename `$key` to `$newKey`, replacing what `$newKey` held.
+     */
+    function rename(const string& $key, const string& $newKey, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(KeyCommands::rename($key, $newKey), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Rename `$key` to `$newKey` only when `$newKey` does not exist. True when it did.
+     */
+    function renameNx(const string& $key, const string& $newKey, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::renameNx($key, $newKey), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * Copy the value at `$source` to `$destination`. False when `$destination` exists and
+     * `$replace` is off.
+     */
+    function copy(const string& $source, const string& $destination, replace: bool $replace = false, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::copy($source, $destination, $replace), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * Count `$keys` as used just now, and answer how many exist.
+     */
+    function touch(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::touch($keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * A key picked at random, or null when the database is empty.
+     */
+    function randomKey(by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::randomKey(), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Every key matching the glob `$pattern`. It walks the whole database at once: `scan` walks it
+     * a page at a time.
+     */
+    function keys(const string& $pattern, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::keys($pattern), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * One page of the keys, from `$cursor` (`'0'` to start). Go on with the page's cursor until it
+     * is `'0'` again.
+     */
+    function scan(const string& $cursor, ScanOptions $options = ScanOptions(), by: tcp::Deadline? $by = null) : result<ScanPage, Error>
+    {
+        Reply $r = try $this->call(KeyCommands::scan($cursor, $options), by: $by);
+        return Decode::scan($r);
+    }
+}
+
+/**
+ * The commands for keys of any type: deleting, expiring, renaming, scanning, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedKeys
+{
+    /**
+     * Delete `$keys`, and answer how many there were.
+     */
+    function del(const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(KeyCommands::del($keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Delete `$keys`, freeing their memory in the background, and answer how many there were.
+     */
+    function unlink(const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(KeyCommands::unlink($keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * How many of `$keys` exist. A key named twice counts twice.
+     */
+    function exists(const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(KeyCommands::exists($keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Expire `$key` after `$ttl`, to the millisecond. False when there is no such key, or
+     * `$condition` stopped it.
+     */
+    function expire(const string& $key, time::duration $ttl, Condition? $condition = null) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(KeyCommands::expire($key, $ttl, $condition)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * Expire `$key` at a Unix time in milliseconds. False when there is no such key, or
+     * `$condition` stopped it.
+     */
+    function expireAt(const string& $key, int64 $unixMillis, Condition? $condition = null) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(KeyCommands::expireAt($key, $unixMillis, $condition)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * The seconds `$key` has left: -1 when it does not expire, -2 when there is no such key.
+     */
+    function ttl(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(KeyCommands::ttl($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The milliseconds `$key` has left: -1 when it does not expire, -2 when there is no such key.
+     */
+    function pttl(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(KeyCommands::pttl($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Take the expiry off `$key`. False when it had none, or there is no such key.
+     */
+    function persist(const string& $key) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(KeyCommands::persist($key)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * The type of the value at `$key`: `string`, `list`, `set`, `zset`, `hash`, `stream`, or
+     * `none`.
+     */
+    function type(const string& $key) : Deferred<string>
+    {
+        return Deferred<string>($this->queue(KeyCommands::type($key)), (const Reply& $r) => Decode::bytes($r));
+    }
+
+    /**
+     * Rename `$key` to `$newKey`, replacing what `$newKey` held.
+     */
+    function rename(const string& $key, const string& $newKey) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(KeyCommands::rename($key, $newKey)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Rename `$key` to `$newKey` only when `$newKey` does not exist. True when it did.
+     */
+    function renameNx(const string& $key, const string& $newKey) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(KeyCommands::renameNx($key, $newKey)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * Copy the value at `$source` to `$destination`. False when `$destination` exists and
+     * `$replace` is off.
+     */
+    function copy(const string& $source, const string& $destination, replace: bool $replace = false) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(KeyCommands::copy($source, $destination, $replace)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * Count `$keys` as used just now, and answer how many exist.
+     */
+    function touch(const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(KeyCommands::touch($keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * A key picked at random, or null when the database is empty.
+     */
+    function randomKey() : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(KeyCommands::randomKey()), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Every key matching the glob `$pattern`. It walks the whole database at once: `scan` walks it
+     * a page at a time.
+     */
+    function keys(const string& $pattern) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(KeyCommands::keys($pattern)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * One page of the keys, from `$cursor` (`'0'` to start). Go on with the page's cursor until it
+     * is `'0'` again.
+     */
+    function scan(const string& $cursor, ScanOptions $options = ScanOptions()) : Deferred<ScanPage>
+    {
+        return Deferred<ScanPage>($this->queue(KeyCommands::scan($cursor, $options)), (const Reply& $r) => Decode::scan($r));
+    }
+}

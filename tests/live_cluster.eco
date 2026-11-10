@@ -1,0 +1,247 @@
+/**
+ * Against a real three-primary cluster: `scripts/test-cluster.sh` starts one in Docker and sets
+ * REDIS_CLUSTER_SEEDS.
+ */
+
+#[if: redis_cluster]
+
+use std::time;
+
+internal function clusterOptions() : redis::Options
+{
+    redis::Options $o = redis::Options();
+    $o->username = 'app';
+    $o->password = 'secret';
+    $o->timeout = time::duration::secs(10);
+    return $o;
+}
+
+internal function seeds() : array<string>
+{
+    string::view $s = guard std::env::var('REDIS_CLUSTER_SEEDS') else {
+        die('REDIS_CLUSTER_SEEDS is not set: run scripts/test-cluster.sh');
+    }
+    return str::split(string($s), ',')->owned();
+}
+
+internal function cluster() : redis::Cluster
+{
+    redis::Cluster $c = guard redis::Cluster::open(seeds(), clusterOptions()) else ($e) {
+        die("cluster: {$e}");
+    }
+    return $c;
+}
+
+/**
+ * A plain connection to the node at `$address`.
+ */
+internal function node(const string& $address) : redis::Connection
+{
+    redis::Options $o = clusterOptions();
+    usize $colon = $address->find(':');
+    $o->host = $address->sub(0, $colon);
+    uint64 $port = str::uint($address->sub($colon + 1, $address->size() - $colon - 1)) ?? 0;
+    $o->port = $port as uint16;
+    return must(redis::Connection::open($o));
+}
+
+/**
+ * The address of the node serving `$slot`, from `CLUSTER SLOTS`.
+ */
+internal function owner(redis::Connection $any, uint16 $slot) : string
+{
+    redis::Reply $slots = must($any->call(['CLUSTER', 'SLOTS']));
+    foreach ($slots->items() ?? array<redis::Reply>() as const &$range) {
+        array<redis::Reply> $parts = $range->items() ?? array<redis::Reply>();
+        int64 $from = $parts[0]->int() ?? 0;
+        int64 $to = $parts[1]->int() ?? 0;
+        if ($slot as int64 >= $from && $slot as int64 <= $to) {
+            array<redis::Reply> $primary = $parts[2]->items() ?? array<redis::Reply>();
+            string $host = $primary[0]->text() ?? '';
+            int64 $port = $primary[1]->int() ?? 0;
+            return "{$host}:{$port}";
+        }
+    }
+    die("no owner for slot {$slot}");
+}
+
+test cluster_learns_three_primaries_and_routes_by_slot
+{
+    redis::Cluster $c = cluster();
+    assert($c->nodes()->count() == 3);
+    // keys spread over every node, each read back through its own primary
+    int32 $i = 0;
+    while ($i < 200) {
+        must($c->set("cl:k:{$i}", "v{$i}"));
+        $i++;
+    }
+    $i = 0;
+    while ($i < 200) {
+        assert((must($c->get("cl:k:{$i}")) ?? '') == "v{$i}");
+        $i++;
+    }
+    // untyped commands find their keys in the server's command table
+    redis::Reply $r = must($c->call(['GET', 'cl:k:7']));
+    assert(($r->text() ?? '') == 'v7');
+    redis::Reply $len = must($c->call(['STRLEN', 'cl:k:150']));
+    assert(($len->int() ?? 0) == 4);
+    fine($c->ping());
+}
+
+test cluster_refuses_keys_in_different_slots_and_takes_tags
+{
+    redis::Cluster $c = cluster();
+    assert(redis::Cluster::slot('user:{42}:name') == redis::Cluster::slot('user:{42}:mail'));
+    assert(redis::Cluster::slot('foo') == 12182);
+    assert(fails($c->mGet(['cl:a', 'cl:b']))->name() == 'crossSlot');
+    fine($c->mSet(['cl:{t}:a' => '1', 'cl:{t}:b' => '2']));
+    array<string?> $both = must($c->mGet(['cl:{t}:a', 'cl:{t}:b']));
+    assert(($both[1] ?? '') == '2');
+    assert(fails($c->call(['MGET', 'cl:a', 'cl:b']))->name() == 'crossSlot');
+}
+
+test cluster_pipeline_splits_by_node_and_keeps_the_order
+{
+    redis::Cluster $c = cluster();
+    redis::Pipeline $p = $c->pipeline();
+    array<redis::Deferred<int64>> $all = array<redis::Deferred<int64>>();
+    int32 $i = 0;
+    while ($i < 300) {
+        must($c->del(["cl:p:{$i}"]));
+        $all->push($p->incrBy("cl:p:{$i}", ($i + 1) as int64));
+        $i++;
+    }
+    fine($p->run());
+    $i = 0;
+    while ($i < 300) {
+        assert(must($all[$i as usize]->value()) == ($i + 1) as int64);
+        $i++;
+    }
+}
+
+test cluster_transaction_runs_on_the_slot_owner
+{
+    redis::Cluster $c = cluster();
+    must($c->del(['cl:{tx}:n']));
+    redis::Transaction $tx = $c->multi();
+    redis::Deferred<int64> $a = $tx->incr('cl:{tx}:n');
+    redis::Deferred<int64> $b = $tx->incrBy('cl:{tx}:n', 9);
+    fine($tx->exec());
+    assert(must($b->value()) == 10);
+    redis::Transaction $spread = $c->multi();
+    $spread->incr('cl:x');
+    $spread->incr('cl:y');
+    assert(failsStatus($spread->exec())->name() == 'crossSlot');
+    fine($c->optimistic(['cl:{tx}:n'], function(redis::Connection $db, redis::Transaction $t) : status<redis::Error> {
+        $t->incr('cl:{tx}:n');
+        return .ok;
+    }));
+    assert((must($c->get('cl:{tx}:n')) ?? '') == '11');
+}
+
+test cluster_follows_ask_and_moved_through_a_slot_migration
+{
+    redis::Cluster $c = cluster();
+    string $key = 'cl:{mig}:a';
+    uint16 $slot = redis::Cluster::slot($key);
+    must($c->set($key, 'before'));
+
+    redis::Connection $any = node(seeds()[0]);
+    string $fromAddress = owner($any, $slot);
+    string $toAddress = '';
+    foreach ($c->nodes() as const &$n) {
+        if ($n != $fromAddress) {
+            $toAddress = $n;
+            break;
+        }
+    }
+    redis::Connection $from = node($fromAddress);
+    redis::Connection $to = node($toAddress);
+    string $fromId = must($from->call(['CLUSTER', 'MYID']))->text() ?? '';
+    string $toId = must($to->call(['CLUSTER', 'MYID']))->text() ?? '';
+
+    must($to->call(['CLUSTER', 'SETSLOT', str::from($slot), 'IMPORTING', $fromId]));
+    must($from->call(['CLUSTER', 'SETSLOT', str::from($slot), 'MIGRATING', $toId]));
+
+    // migrating: the old key is still on the source, a new one goes to the target via ASK
+    assert((must($c->get($key)) ?? '') == 'before');
+    must($c->set('cl:{mig}:b', 'new'));
+    assert((must($c->get('cl:{mig}:b')) ?? '') == 'new');
+
+    // move the rest, and give the slot to the target: the source answers MOVED from now on
+    usize $colon = $toAddress->find(':');
+    must($from->call(['MIGRATE', $toAddress->sub(0, $colon), $toAddress->sub($colon + 1, $toAddress->size() - $colon - 1), '', '0', '5000', 'AUTH2', 'app', 'secret', 'KEYS', $key]));
+    must($to->call(['CLUSTER', 'SETSLOT', str::from($slot), 'NODE', $toId]));
+    must($from->call(['CLUSTER', 'SETSLOT', str::from($slot), 'NODE', $toId]));
+    foreach ($c->nodes() as const &$n) {
+        if ($n != $fromAddress && $n != $toAddress) {
+            redis::Connection $third = node($n);
+            must($third->call(['CLUSTER', 'SETSLOT', str::from($slot), 'NODE', $toId]));
+        }
+    }
+    assert((must($c->get($key)) ?? '') == 'before');
+    assert((must($c->get('cl:{mig}:b')) ?? '') == 'new');
+    assert(owner($any, $slot) == $toAddress);
+}
+
+test cluster_pubsub_and_shard_channels
+{
+    redis::Cluster $c = cluster();
+    redis::Subscriber $s = must($c->subscriber());
+    fine($s->subscribe(['cl:news']));
+    // classic channels reach subscribers on every node; the count is the receiving node's own
+    must($c->publish('cl:news', 'hi'));
+    redis::Message $m = guard must($s->next(by: tcp::Deadline(ms: 2000))) else {
+        die('no message');
+    }
+    assert($m->payload == 'hi');
+
+    redis::Connection $probe = node(seeds()[0]);
+    if (major($probe) >= 7) {
+        redis::Subscriber $sh = must($c->shardSubscriber('cl:shard'));
+        fine($sh->ssubscribe(['cl:shard']));
+        assert(must($c->sPublish('cl:shard', 'sharded')) == 1);
+        redis::Message $sm = guard must($sh->next(by: tcp::Deadline(ms: 2000))) else {
+            die('no shard message');
+        }
+        assert($sm->payload == 'sharded');
+    }
+}
+
+test cluster_loads_functions_on_every_primary_and_scans_each_one
+{
+    redis::Cluster $c = cluster();
+    assert($c->primaries()->count() == 3);
+    string $lib = "#!lua name=libredis_live\nredis.register_function('livefn', function(keys, args) return keys[1] end)";
+    assert(must($c->functionLoad($lib, replace: true)) == 'libredis_live');
+    // a key on each primary: the function is there for every one of them
+    array<string> $keys = ['{a}live', '{b}live', '{c}live', '{d}live', '{e}live', '{f}live'];
+    foreach ($keys as const &$k) {
+        assert((must($c->fCall('livefn', [$k]))->text() ?? '') == $k);
+        must($c->set($k, 'v'));
+    }
+    assert(fails($c->scan('0'))->name() == 'unroutable');
+    // scanning each primary in turn sees every key once
+    int32 $found = 0;
+    foreach ($c->primaries() as $node) {
+        string $cursor = '0';
+        while (true) {
+            redis::ScanOptions $o = redis::ScanOptions();
+            $o->pattern = '*live';
+            redis::ScanPage $page = must($node->scan($cursor, $o));
+            foreach ($page->items as const &$item) {
+                $found++;
+            }
+            $cursor = $page->cursor;
+            if ($page->done()) {
+                break;
+            }
+        }
+    }
+    assert($found == 6);
+    fine($c->functionDelete('libredis_live'));
+    assert(fails($c->fCall('livefn', ['{a}live']))->is('ERR'));
+    $c->close();
+}
+
+#[end]

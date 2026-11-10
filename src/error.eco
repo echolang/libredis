@@ -1,0 +1,222 @@
+namespace redis;
+
+/**
+ * An error reply: the server refused the command. `code` is its first word when that is in
+ * capitals (`ERR`, `WRONGTYPE`, `NOSCRIPT`, `MOVED`, `WRONGPASS`), and empty when the reply has
+ * none, as a Lua script's own errors may not.
+ */
+public struct ServerError
+{
+    public string $code;
+    public string $message;
+
+    public constructor(string $code, string $message)
+    {
+        $this->code = $code;
+        $this->message = $message;
+    }
+
+    /**
+     * The error the server sent as `$line`: `WRONGTYPE Operation against a key holding the wrong
+     * kind of value`.
+     */
+    public constructor(line: string::view $line)
+    {
+        usize $space = 0;
+        while ($space < $line->size && $line->byte($space) != 32) {
+            $space = $space + 1;
+        }
+        bool $upper = $space > 0;
+        usize $i = 0;
+        while ($i < $space) {
+            uint8 $c = $line->byte($i);
+            if (!(($c >= 65 && $c <= 90) || ($c >= 48 && $c <= 57) || $c == 95 || $c == 45)) {
+                $upper = false;
+                break;
+            }
+            $i = $i + 1;
+        }
+        if ($upper) {
+            $this->code = string($line->sub(0, $space));
+            usize $from = $space;
+            if ($from < $line->size) {
+                $from = $from + 1;
+            }
+            $this->message = string($line->sub($from, $line->size - $from));
+        } else {
+            $this->code = '';
+            $this->message = string($line);
+        }
+    }
+}
+
+/**
+ * What can go wrong talking to Redis. The cases a caller branches on: the server said no
+ * (`server`), the connection is gone (`transport`, `timeout`, `closed`), the reply was not what
+ * the typed call expects (`unexpected`), a transaction lost its race (`aborted`), or the call
+ * could not be made as written (`invalid`, `crossSlot`). `"{$e}"` is the sentence.
+ *
+ * ```echo
+ * guard $r->incr('name') else ($e) {
+ *     if ($e->is('WRONGTYPE')) {
+ *         echo $e->name();    // server
+ *     }
+ * }
+ * ```
+ */
+public enum Error
+{
+    /**
+     * The server refused the command, with its code and message.
+     */
+    case server(ServerError $error);
+
+    /**
+     * The socket failed: refused, reset, closed by the peer, and so on.
+     */
+    case transport(tcp::Error $error);
+
+    /**
+     * The deadline passed first. A reply still owed would answer the next command, so the
+     * connection is closed.
+     */
+    case timeout;
+
+    /**
+     * The connection is closed, or an earlier failure left it unusable.
+     */
+    case closed;
+
+    /**
+     * The server sent something that does not parse as RESP.
+     */
+    case malformed(string $why);
+
+    /**
+     * A reply over `Options->maxReply`.
+     */
+    case tooLarge(uint64 $size);
+
+    /**
+     * The reply parsed, but not into what the typed call returns: an array where a number was
+     * due, say.
+     */
+    case unexpected(string $what);
+
+    /**
+     * EXEC answered nil: a key the transaction watched changed, and nothing ran.
+     */
+    case aborted;
+
+    /**
+     * The keys of one command, or of one transaction, live in different cluster slots.
+     */
+    case crossSlot;
+
+    /**
+     * The cluster could not route the command: no node serves its slot, or it was redirected
+     * more often than `ClusterOptions->maxRedirects` allows.
+     */
+    case unroutable(string $why);
+
+    /**
+     * The call could not be made as written: a URL that does not parse, an argument out of range.
+     */
+    case invalid(string $why);
+
+    /**
+     * No pooled connection came free before the deadline.
+     */
+    case exhausted;
+
+    /**
+     * True when the server refused with `$code`: `'WRONGTYPE'`, `'NOSCRIPT'`, `'BUSYGROUP'`.
+     */
+    public const function is(const string& $code) : bool
+    {
+        ServerError $s = guard $this->server() else {
+            return false;
+        }
+        return $s->code == $code;
+    }
+
+    /**
+     * The server's code, or null when the error did not come from the server.
+     */
+    public const function code() : string?
+    {
+        return $this->server()?->code;
+    }
+
+    /**
+     * The whole server error, or null when the error did not come from the server.
+     */
+    public const function server() : ServerError?
+    {
+        return match ($this) {
+            Error::server($s) => $s,
+            else => null,
+        };
+    }
+
+    /**
+     * True when the same command may succeed if sent again shortly: the server is loading its
+     * data set, a cluster slot is migrating (`TRYAGAIN`), the cluster or the primary is down for
+     * now, or a script is busy. Whether sending it again is safe is the caller's to know.
+     */
+    public const function retryable() : bool
+    {
+        return $this->is('LOADING') || $this->is('TRYAGAIN') || $this->is('CLUSTERDOWN') || $this->is('MASTERDOWN') || $this->is('BUSY');
+    }
+
+    /**
+     * The case's name: `server`, `timeout` and so on. For a log line or a test.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            Error::server($s) => 'server',
+            Error::transport($t) => 'transport',
+            Error::timeout => 'timeout',
+            Error::closed => 'closed',
+            Error::malformed($w) => 'malformed',
+            Error::tooLarge($n) => 'tooLarge',
+            Error::unexpected($w) => 'unexpected',
+            Error::aborted => 'aborted',
+            Error::crossSlot => 'crossSlot',
+            Error::unroutable($w) => 'unroutable',
+            Error::invalid($w) => 'invalid',
+            Error::exhausted => 'exhausted',
+        };
+    }
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::server($s) => str::from($s),
+            Error::transport($t) => $t->message(),
+            Error::timeout => 'timed out',
+            Error::closed => 'the connection is closed',
+            Error::malformed($w) => "malformed reply: {$w}",
+            Error::tooLarge($n) => "a reply of {$n} bytes is over the limit",
+            Error::unexpected($w) => "unexpected reply: {$w}",
+            Error::aborted => 'the transaction was aborted: a watched key changed',
+            Error::crossSlot => 'the keys are in different cluster slots',
+            Error::unroutable($w) => $w,
+            Error::invalid($w) => $w,
+            Error::exhausted => 'no pooled connection came free in time',
+        };
+    }
+}
+
+internal function transportError(tcp::Error $e) : Error
+{
+    match ($e) {
+        tcp::Error::timeout => {
+            return .timeout;
+        },
+        else => {
+            return .transport($e);
+        },
+    }
+}

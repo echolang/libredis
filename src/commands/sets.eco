@@ -1,0 +1,472 @@
+/**
+ * The typed commands for sets: unordered collections of distinct strings: how each is written (`SetCommands`), and the methods that
+ * run them on connections, pools and clusters (`Sets`) or queue them on pipelines and
+ * transactions (`QueuedSets`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct SetCommands
+{
+    internal static function sAdd(const string& $key, const array<string>& $members) : Command
+    {
+        Command $c = Command('SADD');
+        $c->key($key);
+        $c->args($members);
+        return $c;
+    }
+
+    internal static function sRem(const string& $key, const array<string>& $members) : Command
+    {
+        Command $c = Command('SREM');
+        $c->key($key);
+        $c->args($members);
+        return $c;
+    }
+
+    internal static function sMembers(const string& $key) : Command
+    {
+        Command $c = Command('SMEMBERS');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function sIsMember(const string& $key, const string& $member) : Command
+    {
+        Command $c = Command('SISMEMBER');
+        $c->key($key);
+        $c->arg($member);
+        return $c;
+    }
+
+    internal static function smIsMember(const string& $key, const array<string>& $members) : Command
+    {
+        Command $c = Command('SMISMEMBER');
+        $c->key($key);
+        $c->args($members);
+        return $c;
+    }
+
+    internal static function sCard(const string& $key) : Command
+    {
+        Command $c = Command('SCARD');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function sPop(const string& $key) : Command
+    {
+        Command $c = Command('SPOP');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function sPopCount(const string& $key, uint32 $count) : Command
+    {
+        Command $c = Command('SPOP');
+        $c->key($key);
+        $c->arg($count as int64);
+        return $c;
+    }
+
+    internal static function sRandMember(const string& $key) : Command
+    {
+        Command $c = Command('SRANDMEMBER');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function sRandMemberCount(const string& $key, int64 $count) : Command
+    {
+        Command $c = Command('SRANDMEMBER');
+        $c->key($key);
+        $c->arg($count);
+        return $c;
+    }
+
+    internal static function sInter(const array<string>& $keys) : Command
+    {
+        Command $c = Command('SINTER');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function sUnion(const array<string>& $keys) : Command
+    {
+        Command $c = Command('SUNION');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function sDiff(const array<string>& $keys) : Command
+    {
+        Command $c = Command('SDIFF');
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function sInterStore(const string& $destination, const array<string>& $keys) : Command
+    {
+        Command $c = Command('SINTERSTORE');
+        $c->key($destination);
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function sUnionStore(const string& $destination, const array<string>& $keys) : Command
+    {
+        Command $c = Command('SUNIONSTORE');
+        $c->key($destination);
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function sDiffStore(const string& $destination, const array<string>& $keys) : Command
+    {
+        Command $c = Command('SDIFFSTORE');
+        $c->key($destination);
+        $c->keys($keys);
+        return $c;
+    }
+
+    internal static function sMove(const string& $source, const string& $destination, const string& $member) : Command
+    {
+        Command $c = Command('SMOVE');
+        $c->key($source);
+        $c->key($destination);
+        $c->arg($member);
+        return $c;
+    }
+
+    internal static function sScan(const string& $key, const string& $cursor, ScanOptions $options) : Command
+    {
+        Command $c = Command('SSCAN');
+        $c->key($key);
+        $c->arg($cursor);
+        $options->into($c);
+        return $c;
+    }
+}
+
+/**
+ * The commands for sets: unordered collections of distinct strings, each run as it is called and answered with its reply.
+ */
+public interface Sets
+{
+    /**
+     * Add `$members` to the set at `$key`, and answer how many were new.
+     */
+    function sAdd(const string& $key, const array<string>& $members, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sAdd($key, $members), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Remove `$members` from the set at `$key`, and answer how many were there.
+     */
+    function sRem(const string& $key, const array<string>& $members, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sRem($key, $members), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Every member of the set at `$key`, in no order.
+     */
+    function sMembers(const string& $key, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sMembers($key), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * True when `$member` is in the set at `$key`.
+     */
+    function sIsMember(const string& $key, const string& $member, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sIsMember($key, $member), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * For each of `$members`, in order, whether it is in the set at `$key`.
+     */
+    function smIsMember(const string& $key, const array<string>& $members, by: tcp::Deadline? $by = null) : result<array<bool>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::smIsMember($key, $members), by: $by);
+        return Decode::flags($r);
+    }
+
+    /**
+     * How many members the set at `$key` has.
+     */
+    function sCard(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sCard($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Take a member of the set at `$key` at random, or null when it is empty.
+     */
+    function sPop(const string& $key, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sPop($key), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Take up to `$count` members of the set at `$key` at random.
+     */
+    function sPop(const string& $key, count: uint32 $count, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sPopCount($key, $count), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * A member of the set at `$key` at random, left in place. Null when it is empty.
+     */
+    function sRandMember(const string& $key, by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sRandMember($key), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * Up to `$count` distinct members at random; a negative `$count` may repeat them.
+     */
+    function sRandMember(const string& $key, count: int64 $count, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sRandMemberCount($key, $count), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The members in every one of the sets at `$keys`.
+     */
+    function sInter(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sInter($keys), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The members in any of the sets at `$keys`.
+     */
+    function sUnion(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sUnion($keys), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * The members of the first set at `$keys` in none of the others.
+     */
+    function sDiff(const array<string>& $keys, by: tcp::Deadline? $by = null) : result<array<string>, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sDiff($keys), by: $by);
+        return Decode::texts($r);
+    }
+
+    /**
+     * `sInter` into the set at `$destination`, and answer its size.
+     */
+    function sInterStore(const string& $destination, const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sInterStore($destination, $keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * `sUnion` into the set at `$destination`, and answer its size.
+     */
+    function sUnionStore(const string& $destination, const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sUnionStore($destination, $keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * `sDiff` into the set at `$destination`, and answer its size.
+     */
+    function sDiffStore(const string& $destination, const array<string>& $keys, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sDiffStore($destination, $keys), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Move `$member` from the set at `$source` to the one at `$destination`. False when it was not
+     * in `$source`.
+     */
+    function sMove(const string& $source, const string& $destination, const string& $member, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sMove($source, $destination, $member), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * One page of the set at `$key`, from `$cursor` (`'0'` to start).
+     */
+    function sScan(const string& $key, const string& $cursor, ScanOptions $options = ScanOptions(), by: tcp::Deadline? $by = null) : result<ScanPage, Error>
+    {
+        Reply $r = try $this->call(SetCommands::sScan($key, $cursor, $options), by: $by);
+        return Decode::scan($r);
+    }
+}
+
+/**
+ * The commands for sets: unordered collections of distinct strings, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedSets
+{
+    /**
+     * Add `$members` to the set at `$key`, and answer how many were new.
+     */
+    function sAdd(const string& $key, const array<string>& $members) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SetCommands::sAdd($key, $members)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Remove `$members` from the set at `$key`, and answer how many were there.
+     */
+    function sRem(const string& $key, const array<string>& $members) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SetCommands::sRem($key, $members)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Every member of the set at `$key`, in no order.
+     */
+    function sMembers(const string& $key) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SetCommands::sMembers($key)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * True when `$member` is in the set at `$key`.
+     */
+    function sIsMember(const string& $key, const string& $member) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(SetCommands::sIsMember($key, $member)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * For each of `$members`, in order, whether it is in the set at `$key`.
+     */
+    function smIsMember(const string& $key, const array<string>& $members) : Deferred<array<bool>>
+    {
+        return Deferred<array<bool>>($this->queue(SetCommands::smIsMember($key, $members)), (const Reply& $r) => Decode::flags($r));
+    }
+
+    /**
+     * How many members the set at `$key` has.
+     */
+    function sCard(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SetCommands::sCard($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Take a member of the set at `$key` at random, or null when it is empty.
+     */
+    function sPop(const string& $key) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(SetCommands::sPop($key)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Take up to `$count` members of the set at `$key` at random.
+     */
+    function sPop(const string& $key, count: uint32 $count) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SetCommands::sPopCount($key, $count)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * A member of the set at `$key` at random, left in place. Null when it is empty.
+     */
+    function sRandMember(const string& $key) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(SetCommands::sRandMember($key)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * Up to `$count` distinct members at random; a negative `$count` may repeat them.
+     */
+    function sRandMember(const string& $key, count: int64 $count) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SetCommands::sRandMemberCount($key, $count)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The members in every one of the sets at `$keys`.
+     */
+    function sInter(const array<string>& $keys) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SetCommands::sInter($keys)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The members in any of the sets at `$keys`.
+     */
+    function sUnion(const array<string>& $keys) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SetCommands::sUnion($keys)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * The members of the first set at `$keys` in none of the others.
+     */
+    function sDiff(const array<string>& $keys) : Deferred<array<string>>
+    {
+        return Deferred<array<string>>($this->queue(SetCommands::sDiff($keys)), (const Reply& $r) => Decode::texts($r));
+    }
+
+    /**
+     * `sInter` into the set at `$destination`, and answer its size.
+     */
+    function sInterStore(const string& $destination, const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SetCommands::sInterStore($destination, $keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * `sUnion` into the set at `$destination`, and answer its size.
+     */
+    function sUnionStore(const string& $destination, const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SetCommands::sUnionStore($destination, $keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * `sDiff` into the set at `$destination`, and answer its size.
+     */
+    function sDiffStore(const string& $destination, const array<string>& $keys) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(SetCommands::sDiffStore($destination, $keys)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Move `$member` from the set at `$source` to the one at `$destination`. False when it was not
+     * in `$source`.
+     */
+    function sMove(const string& $source, const string& $destination, const string& $member) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(SetCommands::sMove($source, $destination, $member)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * One page of the set at `$key`, from `$cursor` (`'0'` to start).
+     */
+    function sScan(const string& $key, const string& $cursor, ScanOptions $options = ScanOptions()) : Deferred<ScanPage>
+    {
+        return Deferred<ScanPage>($this->queue(SetCommands::sScan($key, $cursor, $options)), (const Reply& $r) => Decode::scan($r));
+    }
+}

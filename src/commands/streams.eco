@@ -1,0 +1,517 @@
+/**
+ * The typed commands for streams: append-only logs read by id, alone or in consumer groups: how each is written (`StreamCommands`), and the methods that
+ * run them on connections, pools and clusters (`Streams`) or queue them on pipelines and
+ * transactions (`QueuedStreams`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct StreamCommands
+{
+    internal static function xAdd(const string& $key, const ordered_map<string, string>& $fields, XAddOptions $options) : Command
+    {
+        Command $c = Command('XADD');
+        $c->key($key);
+        $options->into($c);
+        foreach ($fields as $f => const &$v) {
+            $c->arg($f)->arg($v);
+        }
+        return $c;
+    }
+
+    internal static function xLen(const string& $key) : Command
+    {
+        Command $c = Command('XLEN');
+        $c->key($key);
+        return $c;
+    }
+
+    internal static function xDel(const string& $key, const array<string>& $ids) : Command
+    {
+        Command $c = Command('XDEL');
+        $c->key($key);
+        $c->args($ids);
+        return $c;
+    }
+
+    internal static function xTrim(const string& $key, const Trim& $trim) : Command
+    {
+        Command $c = Command('XTRIM');
+        $c->key($key);
+        $trim->into($c);
+        return $c;
+    }
+
+    internal static function xRange(const string& $key, const string& $start, const string& $end, uint32? $count) : Command
+    {
+        Command $c = Command('XRANGE');
+        $c->key($key);
+        $c->arg($start);
+        $c->arg($end);
+        if ($count != null) {
+            uint32 $n = guard $count;
+            $c->arg('COUNT')->arg($n as int64);
+        }
+        return $c;
+    }
+
+    internal static function xRevRange(const string& $key, const string& $end, const string& $start, uint32? $count) : Command
+    {
+        Command $c = Command('XREVRANGE');
+        $c->key($key);
+        $c->arg($end);
+        $c->arg($start);
+        if ($count != null) {
+            uint32 $n = guard $count;
+            $c->arg('COUNT')->arg($n as int64);
+        }
+        return $c;
+    }
+
+    internal static function xRead(const ordered_map<string, string>& $streams, uint32? $count, time::duration? $block) : Command
+    {
+        Command $c = Command('XREAD');
+        if ($count != null) {
+            uint32 $n = guard $count;
+            $c->arg('COUNT')->arg($n as int64);
+        }
+        if ($block != null) {
+            time::duration $b = guard $block;
+            $c->blockArg($b);
+        }
+        $c->arg('STREAMS');
+        foreach ($streams as $s => const &$id) {
+            $c->key($s);
+        }
+        foreach ($streams as $s => const &$id) {
+            $c->arg($id);
+        }
+        return $c;
+    }
+
+    internal static function xReadGroup(const string& $group, const string& $consumer, const ordered_map<string, string>& $streams, uint32? $count, time::duration? $block, bool $noAck) : Command
+    {
+        Command $c = Command('XREADGROUP');
+        $c->arg('GROUP');
+        $c->arg($group);
+        $c->arg($consumer);
+        if ($count != null) {
+            uint32 $n = guard $count;
+            $c->arg('COUNT')->arg($n as int64);
+        }
+        if ($block != null) {
+            time::duration $b = guard $block;
+            $c->blockArg($b);
+        }
+        if ($noAck) {
+            $c->arg('NOACK');
+        }
+        $c->arg('STREAMS');
+        foreach ($streams as $s => const &$id) {
+            $c->key($s);
+        }
+        foreach ($streams as $s => const &$id) {
+            $c->arg($id);
+        }
+        return $c;
+    }
+
+    internal static function xAck(const string& $key, const string& $group, const array<string>& $ids) : Command
+    {
+        Command $c = Command('XACK');
+        $c->key($key);
+        $c->arg($group);
+        $c->args($ids);
+        return $c;
+    }
+
+    internal static function xGroupCreate(const string& $key, const string& $group, const string& $id, bool $mkStream) : Command
+    {
+        Command $c = Command('XGROUP');
+        $c->arg('CREATE');
+        $c->key($key);
+        $c->arg($group);
+        $c->arg($id);
+        if ($mkStream) {
+            $c->arg('MKSTREAM');
+        }
+        return $c;
+    }
+
+    internal static function xGroupDestroy(const string& $key, const string& $group) : Command
+    {
+        Command $c = Command('XGROUP');
+        $c->arg('DESTROY');
+        $c->key($key);
+        $c->arg($group);
+        return $c;
+    }
+
+    internal static function xGroupDelConsumer(const string& $key, const string& $group, const string& $consumer) : Command
+    {
+        Command $c = Command('XGROUP');
+        $c->arg('DELCONSUMER');
+        $c->key($key);
+        $c->arg($group);
+        $c->arg($consumer);
+        return $c;
+    }
+
+    internal static function xPending(const string& $key, const string& $group) : Command
+    {
+        Command $c = Command('XPENDING');
+        $c->key($key);
+        $c->arg($group);
+        return $c;
+    }
+
+    internal static function xPendingRange(const string& $key, const string& $group, const string& $start, const string& $end, uint32 $count, string? $consumer, time::duration? $minIdle) : Command
+    {
+        Command $c = Command('XPENDING');
+        $c->key($key);
+        $c->arg($group);
+        if ($minIdle != null) {
+            time::duration $idle = guard $minIdle;
+            $c->arg('IDLE')->arg($idle->as_millis());
+        }
+        $c->arg($start)->arg($end)->arg($count as int64);
+        if ($consumer != null) {
+            string $who = guard $consumer;
+            $c->arg($who);
+        }
+        return $c;
+    }
+
+    internal static function xClaim(const string& $key, const string& $group, const string& $consumer, time::duration $minIdle, const array<string>& $ids) : Command
+    {
+        Command $c = Command('XCLAIM');
+        $c->key($key);
+        $c->arg($group);
+        $c->arg($consumer);
+        $c->arg($minIdle->as_millis());
+        $c->args($ids);
+        return $c;
+    }
+
+    internal static function xAutoClaim(const string& $key, const string& $group, const string& $consumer, time::duration $minIdle, const string& $start, uint32? $count) : Command
+    {
+        Command $c = Command('XAUTOCLAIM');
+        $c->key($key);
+        $c->arg($group);
+        $c->arg($consumer);
+        $c->arg($minIdle->as_millis());
+        $c->arg($start);
+        if ($count != null) {
+            uint32 $n = guard $count;
+            $c->arg('COUNT')->arg($n as int64);
+        }
+        return $c;
+    }
+}
+
+/**
+ * The commands for streams: append-only logs read by id, alone or in consumer groups, each run as it is called and answered with its reply.
+ */
+public interface Streams
+{
+    /**
+     * Append an entry with `$fields` to the stream at `$key`, and answer its id. Null when
+     * `noMkStream` is set and there is no stream.
+     */
+    function xAdd(const string& $key, const ordered_map<string, string>& $fields, XAddOptions $options = XAddOptions(), by: tcp::Deadline? $by = null) : result<string?, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xAdd($key, $fields, $options), by: $by);
+        return Decode::text($r);
+    }
+
+    /**
+     * How many entries the stream at `$key` has.
+     */
+    function xLen(const string& $key, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xLen($key), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Delete the entries `$ids`, and answer how many were there.
+     */
+    function xDel(const string& $key, const array<string>& $ids, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xDel($key, $ids), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Trim the stream at `$key`, and answer how many entries went.
+     */
+    function xTrim(const string& $key, const Trim& $trim, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xTrim($key, $trim), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * The entries from `$start` to `$end` (`-` and `+` are the ends), oldest first, at most
+     * `$count` when set.
+     */
+    function xRange(const string& $key, const string& $start = '-', const string& $end = '+', count: uint32? $count = null, by: tcp::Deadline? $by = null) : result<array<StreamEntry>, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xRange($key, $start, $end, $count), by: $by);
+        return Decode::entries($r);
+    }
+
+    /**
+     * The entries from `$end` down to `$start`, newest first, at most `$count` when set.
+     */
+    function xRevRange(const string& $key, const string& $end = '+', const string& $start = '-', count: uint32? $count = null, by: tcp::Deadline? $by = null) : result<array<StreamEntry>, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xRevRange($key, $end, $start, $count), by: $by);
+        return Decode::entries($r);
+    }
+
+    /**
+     * The entries after the given id of each stream in `$streams` (`$` for only new ones), at most
+     * `$count` per stream, waiting up to `$block` when set. Empty when the wait ran out.
+     */
+    function xRead(const ordered_map<string, string>& $streams, count: uint32? $count = null, block: time::duration? $block = null, by: tcp::Deadline? $by = null) : result<array<StreamMessages>, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xRead($streams, $count, $block), by: $by);
+        return Decode::streams($r);
+    }
+
+    /**
+     * Read for `$consumer` of `$group`: `>` as the id takes entries never delivered to the group,
+     * another id re-reads this consumer's pending ones. `$noAck` takes them without making them
+     * pending.
+     */
+    function xReadGroup(const string& $group, const string& $consumer, const ordered_map<string, string>& $streams, count: uint32? $count = null, block: time::duration? $block = null, noAck: bool $noAck = false, by: tcp::Deadline? $by = null) : result<array<StreamMessages>, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xReadGroup($group, $consumer, $streams, $count, $block, $noAck), by: $by);
+        return Decode::streams($r);
+    }
+
+    /**
+     * Acknowledge the entries `$ids` for `$group`, and answer how many were pending.
+     */
+    function xAck(const string& $key, const string& $group, const array<string>& $ids, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xAck($key, $group, $ids), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * Make the consumer group `$group`, reading from after `$id` (`$` for new entries only, `0` for
+     * all). `$mkStream` makes the stream too when there is none.
+     */
+    function xGroupCreate(const string& $key, const string& $group, const string& $id = '$', mkStream: bool $mkStream = false, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(StreamCommands::xGroupCreate($key, $group, $id, $mkStream), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Remove the consumer group `$group`. False when there was none.
+     */
+    function xGroupDestroy(const string& $key, const string& $group, by: tcp::Deadline? $by = null) : result<bool, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xGroupDestroy($key, $group), by: $by);
+        return Decode::flag($r);
+    }
+
+    /**
+     * Remove `$consumer` from `$group`, and answer how many entries it had pending.
+     */
+    function xGroupDelConsumer(const string& $key, const string& $group, const string& $consumer, by: tcp::Deadline? $by = null) : result<int64, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xGroupDelConsumer($key, $group, $consumer), by: $by);
+        return Decode::int($r);
+    }
+
+    /**
+     * How many entries `$group` has pending, their lowest and highest ids, and which consumers hold
+     * them.
+     */
+    function xPending(const string& $key, const string& $group, by: tcp::Deadline? $by = null) : result<PendingSummary, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xPending($key, $group), by: $by);
+        return Decode::pendingSummary($r);
+    }
+
+    /**
+     * The pending entries of `$group` from `$start` to `$end`, at most `$count`, only `$consumer`'s
+     * when set, only those idle at least `$minIdle` when set.
+     */
+    function xPendingRange(const string& $key, const string& $group, const string& $start, const string& $end, uint32 $count, consumer: string? $consumer = null, minIdle: time::duration? $minIdle = null, by: tcp::Deadline? $by = null) : result<array<PendingEntry>, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xPendingRange($key, $group, $start, $end, $count, $consumer, $minIdle), by: $by);
+        return Decode::pendingEntries($r);
+    }
+
+    /**
+     * Take over the pending entries `$ids` for `$consumer`, those idle at least `$minIdle`, and
+     * answer them.
+     */
+    function xClaim(const string& $key, const string& $group, const string& $consumer, time::duration $minIdle, const array<string>& $ids, by: tcp::Deadline? $by = null) : result<array<StreamEntry>, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xClaim($key, $group, $consumer, $minIdle, $ids), by: $by);
+        return Decode::entries($r);
+    }
+
+    /**
+     * Take over for `$consumer` the pending entries from `$start` idle at least `$minIdle`, at most
+     * `$count`.
+     */
+    function xAutoClaim(const string& $key, const string& $group, const string& $consumer, time::duration $minIdle, const string& $start = '0-0', count: uint32? $count = null, by: tcp::Deadline? $by = null) : result<AutoClaimed, Error>
+    {
+        Reply $r = try $this->call(StreamCommands::xAutoClaim($key, $group, $consumer, $minIdle, $start, $count), by: $by);
+        return Decode::autoClaimed($r);
+    }
+}
+
+/**
+ * The commands for streams: append-only logs read by id, alone or in consumer groups, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedStreams
+{
+    /**
+     * Append an entry with `$fields` to the stream at `$key`, and answer its id. Null when
+     * `noMkStream` is set and there is no stream.
+     */
+    function xAdd(const string& $key, const ordered_map<string, string>& $fields, XAddOptions $options = XAddOptions()) : Deferred<string?>
+    {
+        return Deferred<string?>($this->queue(StreamCommands::xAdd($key, $fields, $options)), (const Reply& $r) => Decode::text($r));
+    }
+
+    /**
+     * How many entries the stream at `$key` has.
+     */
+    function xLen(const string& $key) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StreamCommands::xLen($key)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Delete the entries `$ids`, and answer how many were there.
+     */
+    function xDel(const string& $key, const array<string>& $ids) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StreamCommands::xDel($key, $ids)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Trim the stream at `$key`, and answer how many entries went.
+     */
+    function xTrim(const string& $key, const Trim& $trim) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StreamCommands::xTrim($key, $trim)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * The entries from `$start` to `$end` (`-` and `+` are the ends), oldest first, at most
+     * `$count` when set.
+     */
+    function xRange(const string& $key, const string& $start = '-', const string& $end = '+', count: uint32? $count = null) : Deferred<array<StreamEntry>>
+    {
+        return Deferred<array<StreamEntry>>($this->queue(StreamCommands::xRange($key, $start, $end, $count)), (const Reply& $r) => Decode::entries($r));
+    }
+
+    /**
+     * The entries from `$end` down to `$start`, newest first, at most `$count` when set.
+     */
+    function xRevRange(const string& $key, const string& $end = '+', const string& $start = '-', count: uint32? $count = null) : Deferred<array<StreamEntry>>
+    {
+        return Deferred<array<StreamEntry>>($this->queue(StreamCommands::xRevRange($key, $end, $start, $count)), (const Reply& $r) => Decode::entries($r));
+    }
+
+    /**
+     * The entries after the given id of each stream in `$streams` (`$` for only new ones), at most
+     * `$count` per stream, waiting up to `$block` when set. Empty when the wait ran out.
+     */
+    function xRead(const ordered_map<string, string>& $streams, count: uint32? $count = null, block: time::duration? $block = null) : Deferred<array<StreamMessages>>
+    {
+        return Deferred<array<StreamMessages>>($this->queue(StreamCommands::xRead($streams, $count, $block)), (const Reply& $r) => Decode::streams($r));
+    }
+
+    /**
+     * Read for `$consumer` of `$group`: `>` as the id takes entries never delivered to the group,
+     * another id re-reads this consumer's pending ones. `$noAck` takes them without making them
+     * pending.
+     */
+    function xReadGroup(const string& $group, const string& $consumer, const ordered_map<string, string>& $streams, count: uint32? $count = null, block: time::duration? $block = null, noAck: bool $noAck = false) : Deferred<array<StreamMessages>>
+    {
+        return Deferred<array<StreamMessages>>($this->queue(StreamCommands::xReadGroup($group, $consumer, $streams, $count, $block, $noAck)), (const Reply& $r) => Decode::streams($r));
+    }
+
+    /**
+     * Acknowledge the entries `$ids` for `$group`, and answer how many were pending.
+     */
+    function xAck(const string& $key, const string& $group, const array<string>& $ids) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StreamCommands::xAck($key, $group, $ids)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * Make the consumer group `$group`, reading from after `$id` (`$` for new entries only, `0` for
+     * all). `$mkStream` makes the stream too when there is none.
+     */
+    function xGroupCreate(const string& $key, const string& $group, const string& $id = '$', mkStream: bool $mkStream = false) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StreamCommands::xGroupCreate($key, $group, $id, $mkStream)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Remove the consumer group `$group`. False when there was none.
+     */
+    function xGroupDestroy(const string& $key, const string& $group) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(StreamCommands::xGroupDestroy($key, $group)), (const Reply& $r) => Decode::flag($r));
+    }
+
+    /**
+     * Remove `$consumer` from `$group`, and answer how many entries it had pending.
+     */
+    function xGroupDelConsumer(const string& $key, const string& $group, const string& $consumer) : Deferred<int64>
+    {
+        return Deferred<int64>($this->queue(StreamCommands::xGroupDelConsumer($key, $group, $consumer)), (const Reply& $r) => Decode::int($r));
+    }
+
+    /**
+     * How many entries `$group` has pending, their lowest and highest ids, and which consumers hold
+     * them.
+     */
+    function xPending(const string& $key, const string& $group) : Deferred<PendingSummary>
+    {
+        return Deferred<PendingSummary>($this->queue(StreamCommands::xPending($key, $group)), (const Reply& $r) => Decode::pendingSummary($r));
+    }
+
+    /**
+     * The pending entries of `$group` from `$start` to `$end`, at most `$count`, only `$consumer`'s
+     * when set, only those idle at least `$minIdle` when set.
+     */
+    function xPendingRange(const string& $key, const string& $group, const string& $start, const string& $end, uint32 $count, consumer: string? $consumer = null, minIdle: time::duration? $minIdle = null) : Deferred<array<PendingEntry>>
+    {
+        return Deferred<array<PendingEntry>>($this->queue(StreamCommands::xPendingRange($key, $group, $start, $end, $count, $consumer, $minIdle)), (const Reply& $r) => Decode::pendingEntries($r));
+    }
+
+    /**
+     * Take over the pending entries `$ids` for `$consumer`, those idle at least `$minIdle`, and
+     * answer them.
+     */
+    function xClaim(const string& $key, const string& $group, const string& $consumer, time::duration $minIdle, const array<string>& $ids) : Deferred<array<StreamEntry>>
+    {
+        return Deferred<array<StreamEntry>>($this->queue(StreamCommands::xClaim($key, $group, $consumer, $minIdle, $ids)), (const Reply& $r) => Decode::entries($r));
+    }
+
+    /**
+     * Take over for `$consumer` the pending entries from `$start` idle at least `$minIdle`, at most
+     * `$count`.
+     */
+    function xAutoClaim(const string& $key, const string& $group, const string& $consumer, time::duration $minIdle, const string& $start = '0-0', count: uint32? $count = null) : Deferred<AutoClaimed>
+    {
+        return Deferred<AutoClaimed>($this->queue(StreamCommands::xAutoClaim($key, $group, $consumer, $minIdle, $start, $count)), (const Reply& $r) => Decode::autoClaimed($r));
+    }
+}

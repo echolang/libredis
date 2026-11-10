@@ -1,0 +1,110 @@
+/**
+ * `"{$e}"` and `echo` for this library's types.
+ */
+
+namespace str;
+
+public function from(const redis::Error& $e) : string
+{
+    return $e->message();
+}
+
+public function from(const redis::ServerError& $e) : string
+{
+    if ($e->code->empty()) {
+        return $e->message;
+    }
+    return "{$e->code} {$e->message}";
+}
+
+/**
+ * A reply in one line: strings quoted, `nil`, `[a, b]` for arrays and sets, `{k: v}` for maps.
+ * For a log line or a test, not for parsing back.
+ */
+public function from(const redis::Reply& $r) : string
+{
+    string $out = '';
+    redis::describe($r, $out);
+    return $out;
+}
+
+namespace redis;
+
+internal function describe(const Reply& $r, string& $out) : void
+{
+    match ($r) {
+        Reply::simple($t) => {
+            $out->append($t);
+        },
+        Reply::error($e) => {
+            $out->append('(error) ');
+            $out->append(str::from($e));
+        },
+        Reply::int($n) => {
+            $out->append(str::from($n));
+        },
+        Reply::bulk($d) => {
+            $out->push(34);
+            $out->append($d);
+            $out->push(34);
+        },
+        Reply::nil => {
+            $out->append('nil');
+        },
+        Reply::double($x) => {
+            $out->append(floatArg($x));
+        },
+        Reply::bool($b) => {
+            if ($b) {
+                $out->append('true');
+            } else {
+                $out->append('false');
+            }
+        },
+        Reply::big($d) => {
+            $out->append($d);
+        },
+        Reply::verbatim($f, $t) => {
+            $out->push(34);
+            $out->append($t);
+            $out->push(34);
+        },
+        Reply::array($a) => {
+            describeAll($a, '[', ']', $out);
+        },
+        Reply::set($s) => {
+            describeAll($s, '[', ']', $out);
+        },
+        Reply::push($p) => {
+            describeAll($p, '>[', ']', $out);
+        },
+        Reply::map($m) => {
+            $out->push(123);
+            bool $first = true;
+            foreach ($m as const &$p) {
+                if (!$first) {
+                    $out->append(', ');
+                }
+                $first = false;
+                describe($p->key, $out);
+                $out->append(': ');
+                describe($p->value, $out);
+            }
+            $out->push(125);
+        },
+    }
+}
+
+internal function describeAll(const array<Reply>& $items, const string& $open, const string& $close, string& $out) : void
+{
+    $out->append($open);
+    usize $i = 0;
+    foreach ($items as const &$item) {
+        if ($i > 0) {
+            $out->append(', ');
+        }
+        describe($item, $out);
+        $i++;
+    }
+    $out->append($close);
+}

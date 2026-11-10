@@ -1,0 +1,309 @@
+/**
+ * Against a real server: `scripts/test-live.sh` starts one in Docker and sets REDIS_TEST_URL (the
+ * ACL user `app`) and REDIS_ROOT_URL (the default user). Every test keeps to keys of its own, so
+ * none depends on another's leftovers.
+ */
+
+#[if: redis]
+
+use std::time;
+
+internal function liveUrl() : string
+{
+    string::view $url = guard std::env::var('REDIS_TEST_URL') else {
+        die('REDIS_TEST_URL is not set: run scripts/test-live.sh');
+    }
+    return string($url);
+}
+
+internal function liveOptions() : redis::Options
+{
+    return redis::Options::parse(liveUrl())->unwrap();
+}
+
+internal function live() : redis::Connection
+{
+    redis::Connection $r = guard redis::Connection::open(liveUrl()) else ($e) {
+        die("connect: {$e}");
+    }
+    return $r;
+}
+
+internal function rootUrl() : string
+{
+    string::view $url = guard std::env::var('REDIS_ROOT_URL') else {
+        die('REDIS_ROOT_URL is not set: run scripts/test-live.sh');
+    }
+    return string($url);
+}
+
+test live_logs_in_as_an_acl_user_and_as_the_default_user
+{
+    redis::Connection $r = live();
+    assert($r->alive());
+    assert(!$r->version->empty());
+    assert($r->id > 0);
+    assert($r->protocol == redis::Protocol::resp3);
+    fine($r->ping());
+
+    redis::Connection $root = must(redis::Connection::open(rootUrl()));
+    fine($root->ping());
+}
+
+test live_refuses_a_wrong_password
+{
+    redis::Options $o = liveOptions();
+    $o->password = 'nope';
+    redis::Error $e = fails(redis::Connection::open($o));
+    assert($e->is('WRONGPASS'));
+}
+
+test live_speaks_resp2_when_asked
+{
+    redis::Options $o = liveOptions();
+    $o->protocol = redis::Protocol::resp2;
+    redis::Connection $r = must(redis::Connection::open($o));
+    assert($r->protocol == redis::Protocol::resp2);
+    must($r->hSet('live:resp2:h', ['a' => '1', 'b' => '2']));
+    ordered_map<string, string> $h = must($r->hGetAll('live:resp2:h'));
+    assert($h->count() == 2);
+    assert($h['b'] == '2');
+    must($r->zAdd('live:resp2:z', [redis::Scored('x', 1.5), redis::Scored('y', 2.0)]));
+    array<redis::Scored> $z = must($r->zRangeWithScores('live:resp2:z', redis::ZRange(index: 0, -1)));
+    assert($z->count() == 2);
+    assert($z[0]->member == 'x' && $z[0]->score == 1.5);
+    float64? $s = must($r->zScore('live:resp2:z', 'y'));
+    assert(($s ?? 0.0) == 2.0);
+    must($r->del(['live:resp2:h', 'live:resp2:z']));
+}
+
+test live_selects_the_database_of_the_url
+{
+    redis::Options $o = liveOptions();
+    $o->database = 3;
+    $o->clientName = 'libredis-test';
+    redis::Connection $r = must(redis::Connection::open($o));
+    must($r->set('live:db3', 'here'));
+    redis::Connection $zero = live();
+    assert(must($zero->get('live:db3')) == null);
+    assert((must($r->get('live:db3')) ?? '') == 'here');
+    assert((must($r->clientGetName()) ?? '') == 'libredis-test');
+    must($r->del(['live:db3']));
+}
+
+test live_strings_round_trip
+{
+    redis::Connection $r = live();
+    must($r->del(['live:s', 'live:n', 'live:f', 'live:m1', 'live:m2', 'live:bin']));
+    assert(must($r->get('live:s')) == null);
+    assert(must($r->set('live:s', 'hello')));
+    assert((must($r->get('live:s')) ?? '') == 'hello');
+
+    redis::SetOptions $nx = redis::SetOptions();
+    $nx->condition = redis::Condition::nx;
+    assert(!must($r->set('live:s', 'other', $nx)));
+    assert((must($r->setGet('live:s', 'world')) ?? '') == 'hello');
+    assert(must($r->append('live:s', '!')) == 6);
+    assert(must($r->strLen('live:s')) == 6);
+    assert(must($r->getRange('live:s', 0, 2)) == 'wor');
+    assert(must($r->setRange('live:s', 0, 'W')) == 6);
+    assert((must($r->getDel('live:s')) ?? '') == 'World!');
+    assert(must($r->get('live:s')) == null);
+
+    assert(must($r->incr('live:n')) == 1);
+    assert(must($r->incrBy('live:n', 41)) == 42);
+    assert(must($r->decr('live:n')) == 41);
+    assert(must($r->decrBy('live:n', 40)) == 1);
+    assert(must($r->incrByFloat('live:f', 1.5)) == 1.5);
+
+    fine($r->mSet(['live:m1' => 'a', 'live:m2' => 'b']));
+    array<string?> $both = must($r->mGet(['live:m1', 'live:nope', 'live:m2']));
+    assert($both->count() == 3);
+    assert(($both[0] ?? '') == 'a' && $both[1] == null && ($both[2] ?? '') == 'b');
+    assert(!must($r->mSetNx(['live:m1' => 'x', 'live:m3' => 'y'])));
+
+    // binary safe both ways: NUL, CR, LF, high bytes
+    string $bin = "a\0b\r\nc";
+    $bin->push(255);
+    must($r->set('live:bin', $bin));
+    assert((must($r->get('live:bin')) ?? '') == $bin);
+
+    must($r->del(['live:n', 'live:f', 'live:m1', 'live:m2', 'live:bin']));
+}
+
+test live_expiry_and_keys
+{
+    redis::Connection $r = live();
+    must($r->del(['live:k1', 'live:k2', 'live:k3']));
+    must($r->set('live:k1', 'v', ttl: time::duration::secs(100)));
+    int64 $ttl = must($r->pttl('live:k1'));
+    assert($ttl > 90000 && $ttl <= 100000);
+    assert(must($r->persist('live:k1')));
+    assert(must($r->ttl('live:k1')) == -1);
+    assert(must($r->expire('live:k1', time::duration::secs(50))));
+    if (major($r) >= 7) {
+        // conditions came with Redis 7
+        assert(!must($r->expire('live:k1', time::duration::secs(10), redis::Condition::gt)));
+    }
+    assert(must($r->ttl('live:k2')) == -2);
+    assert(must($r->exists(['live:k1', 'live:k1', 'live:k2'])) == 2);
+    assert(must($r->type('live:k1')) == 'string');
+    assert(must($r->type('live:k2')) == 'none');
+    fine($r->rename('live:k1', 'live:k2'));
+    assert(must($r->copy('live:k2', 'live:k3')));
+    assert(!must($r->copy('live:k2', 'live:k3')));
+    assert(must($r->copy('live:k2', 'live:k3', replace: true)));
+    assert(must($r->unlink(['live:k2', 'live:k3'])) == 2);
+
+    redis::Expiry $later = redis::Expiry(after: time::duration::secs(30));
+    must($r->set('live:k1', 'v'));
+    assert((must($r->getEx('live:k1', $later)) ?? '') == 'v');
+    assert(must($r->ttl('live:k1')) > 0);
+    assert((must($r->getEx('live:k1', redis::Expiry::persist())) ?? '') == 'v');
+    assert(must($r->ttl('live:k1')) == -1);
+    must($r->del(['live:k1']));
+}
+
+test live_scan_walks_every_key
+{
+    redis::Connection $r = live();
+    int32 $i = 0;
+    while ($i < 50) {
+        must($r->set("live:scan:{$i}", 'x'));
+        $i++;
+    }
+    redis::ScanOptions $o = redis::ScanOptions();
+    $o->pattern = 'live:scan:*';
+    $o->count = 10;
+    string $cursor = '0';
+    map<string, bool> $seen = map<string, bool>();
+    while (true) {
+        redis::ScanPage $page = must($r->scan($cursor, $o));
+        foreach ($page->items as const &$k) {
+            $seen[$k] = true;
+        }
+        if ($page->done()) {
+            break;
+        }
+        $cursor = $page->cursor;
+    }
+    assert($seen->count() == 50);
+    array<string> $all = must($r->keys('live:scan:*'));
+    assert($all->count() == 50);
+    must($r->del($all));
+}
+
+test live_errors_come_back_as_server_errors_and_the_connection_stays
+{
+    redis::Connection $r = live();
+    must($r->set('live:err', 'text'));
+    redis::Error $e = fails($r->incr('live:err'));
+    assert($e->name() == 'server');
+    assert($e->is('ERR'));
+    must($r->rPush('live:errl', ['x']));
+    redis::Error $wrong = fails($r->get('live:errl'));
+    assert($wrong->is('WRONGTYPE'));
+    redis::Error $unknown = fails($r->call(['NOSUCHCOMMAND']));
+    assert($unknown->is('ERR'));
+    assert($r->alive());
+    fine($r->ping());
+    must($r->del(['live:err', 'live:errl']));
+}
+
+test live_pipeline_answers_each_command
+{
+    redis::Connection $r = live();
+    must($r->del(['live:p:n', 'live:p:s', 'live:p:l']));
+    redis::Pipeline $p = $r->pipeline();
+    redis::Deferred<int64> $a = $p->incr('live:p:n');
+    redis::Deferred<int64> $b = $p->incrBy('live:p:n', 10);
+    redis::Deferred<bool> $set = $p->set('live:p:s', 'v');
+    redis::Deferred<string?> $get = $p->get('live:p:s');
+    redis::Deferred<int64> $bad = $p->incr('live:p:s');
+    redis::Deferred<redis::Reply> $raw = $p->add(['ECHO', 'hi']);
+    assert(!$a->ready());
+    assert(fails($a->value())->name() == 'invalid');
+    assert($p->count() == 6);
+    fine($p->run());
+    assert($p->count() == 0);
+    assert(must($a->value()) == 1);
+    assert(must($b->value()) == 11);
+    assert(must($set->value()));
+    assert((must($get->value()) ?? '') == 'v');
+    assert(fails($bad->value())->is('ERR'));
+    assert((must($raw->value())->text() ?? '') == 'hi');
+
+    // a thousand at once, then the connection is still in step
+    int32 $i = 0;
+    array<redis::Deferred<int64>> $all = array<redis::Deferred<int64>>();
+    while ($i < 1000) {
+        $all->push($p->rPush('live:p:l', ["{$i}"]));
+        $i++;
+    }
+    fine($p->run());
+    assert(must($all[999]->value()) == 1000);
+    assert(must($r->lLen('live:p:l')) == 1000);
+    must($r->del(['live:p:n', 'live:p:s', 'live:p:l']));
+}
+
+test live_transaction_runs_together
+{
+    redis::Connection $r = live();
+    must($r->del(['live:tx:n', 'live:tx:l']));
+    redis::Transaction $tx = $r->multi();
+    redis::Deferred<int64> $n = $tx->incrBy('live:tx:n', 5);
+    redis::Deferred<int64> $l = $tx->rPush('live:tx:l', ['a', 'b']);
+    redis::Deferred<string?> $g = $tx->get('live:tx:n');
+    fine($tx->exec());
+    assert(must($n->value()) == 5);
+    assert(must($l->value()) == 2);
+    assert((must($g->value()) ?? '') == '5');
+
+    // a command that fails as it runs fails alone
+    redis::Transaction $mixed = $r->multi();
+    redis::Deferred<int64> $wrong = $mixed->incr('live:tx:l');
+    redis::Deferred<int64> $right = $mixed->incr('live:tx:n');
+    fine($mixed->exec());
+    assert(fails($wrong->value())->is('WRONGTYPE'));
+    assert(must($right->value()) == 6);
+
+    // a command refused as it is queued aborts it all
+    redis::Transaction $bad = $r->multi();
+    redis::Deferred<int64> $before = $bad->incr('live:tx:n');
+    $bad->add(['GET']);
+    redis::Error $abort = failsStatus($bad->exec());
+    assert($abort->is('EXECABORT'));
+    assert(fails($before->value())->is('EXECABORT'));
+    assert((must($r->get('live:tx:n')) ?? '') == '6');
+    must($r->del(['live:tx:n', 'live:tx:l']));
+}
+
+test live_watch_aborts_when_a_watched_key_changes
+{
+    redis::Connection $r = live();
+    redis::Connection $other = live();
+    must($r->set('live:w', '1'));
+    fine($r->watch(['live:w']));
+    must($other->set('live:w', '2'));
+    redis::Transaction $tx = $r->multi();
+    redis::Deferred<bool> $s = $tx->set('live:w', '3');
+    redis::Error $e = failsStatus($tx->exec());
+    assert($e->name() == 'aborted');
+    assert($s->ready());
+    assert((must($r->get('live:w')) ?? '') == '2');
+
+    // optimistic: the first try loses the race, the second wins
+    int32 $tries = 0;
+    fine($r->optimistic(['live:w'], function(redis::Connection $c, redis::Transaction $t) : status<redis::Error> {
+        string? $now = guard $c->get('live:w') else ($err) {
+            return .error($err);
+        }
+        int64 $n = str::int($now ?? '0') ?? 0;
+        $t->set('live:w', str::from($n + 10));
+        return .ok;
+    }));
+    assert((must($r->get('live:w')) ?? '') == '12');
+    must($r->del(['live:w']));
+}
+
+#[end]

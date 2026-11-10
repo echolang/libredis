@@ -1,0 +1,100 @@
+/**
+ * `Options::parse`: what a URL sets, and what it refuses.
+ */
+
+use std::time;
+
+internal function parsed(const string& $url) : redis::Options
+{
+    redis::Options $o = guard redis::Options::parse($url) else ($e) {
+        die("parse {$url}: {$e}");
+    }
+    return $o;
+}
+
+internal function refusedUrl(const string& $url) : string
+{
+    result<redis::Options, redis::Error> $r = redis::Options::parse($url);
+    if (!$r->failed()) {
+        die("{$url} was not refused");
+    }
+    return $r->failure()->message();
+}
+
+test a_bare_url_takes_the_defaults
+{
+    redis::Options $o = parsed('redis://');
+    assert($o->host == '127.0.0.1' && $o->port == 6379 && $o->database == 0);
+    assert($o->username == null && $o->password == null);
+    assert($o->protocol == redis::Protocol::resp3);
+    assert($o->timeout == null);
+}
+
+test a_url_sets_host_port_database_and_credentials
+{
+    redis::Options $o = parsed('redis://app:s3cret@cache.local:6380/4');
+    assert($o->host == 'cache.local' && $o->port == 6380 && $o->database == 4);
+    assert(($o->username ?? '') == 'app' && ($o->password ?? '') == 's3cret');
+
+    redis::Options $pw = parsed('redis://:only@host');
+    assert($pw->username == null && ($pw->password ?? '') == 'only');
+    redis::Options $empty = parsed('redis://:@host');
+    assert(($empty->password ?? 'x') == '');
+    redis::Options $user = parsed('redis://bob@host');
+    assert(($user->username ?? '') == 'bob' && $user->password == null);
+}
+
+test credentials_and_hosts_are_percent_decoded
+{
+    redis::Options $o = parsed('redis://us%40er:p%3Ass%2Fw@host');
+    assert(($o->username ?? '') == 'us@er' && ($o->password ?? '') == 'p:ss/w');
+    // the last @ ends the user info, so an unescaped one in the password still works
+    redis::Options $at = parsed('redis://:p@ss@host:7000');
+    assert(($at->password ?? '') == 'p@ss' && $at->host == 'host' && $at->port == 7000);
+    redis::Options $v6 = parsed('redis://[::1]:6390');
+    assert($v6->host == '::1' && $v6->port == 6390);
+    redis::Options $v6bare = parsed('redis://[fe80::1]');
+    assert($v6bare->host == 'fe80::1' && $v6bare->port == 6379);
+}
+
+test query_options_are_read
+{
+    redis::Options $o = parsed('redis://h?db=2&name=worker%201&protocol=2&timeout=250ms&connect_timeout=3s&max_reply=2048&username=u&password=p');
+    assert($o->database == 2);
+    assert($o->clientName == 'worker 1');
+    assert($o->protocol == redis::Protocol::resp2);
+    assert(($o->timeout?->as_millis() ?? 0) == 250);
+    assert($o->connectTimeout->as_millis() == 3000);
+    assert($o->maxReply == 2048);
+    assert(($o->username ?? '') == 'u' && ($o->password ?? '') == 'p');
+    redis::Options $mins = parsed('redis://h?timeout=2m');
+    assert(($mins->timeout?->as_millis() ?? 0) == 120000);
+    redis::Options $secs = parsed('redis://h?timeout=5');
+    assert(($secs->timeout?->as_millis() ?? 0) == 5000);
+}
+
+test a_unix_url_names_the_socket
+{
+    redis::Options $o = parsed('unix:///run/redis/redis.sock?db=3&password=pw');
+    assert(($o->socket ?? '') == '/run/redis/redis.sock');
+    assert($o->database == 3 && ($o->password ?? '') == 'pw');
+    redis::Options $auth = parsed('unix://u:p@/tmp/r.sock');
+    assert(($auth->socket ?? '') == '/tmp/r.sock' && ($auth->username ?? '') == 'u');
+}
+
+test bad_urls_are_refused_with_a_reason
+{
+    assert(refusedUrl('http://host')->contains('redis://'));
+    assert(refusedUrl('rediss://host')->contains('TLS'));
+    assert(refusedUrl('redis://host:0')->contains('1..65535'));
+    assert(refusedUrl('redis://host:70000')->contains('1..65535'));
+    assert(refusedUrl('redis://host:abc')->contains('not a number'));
+    assert(refusedUrl('redis://host/x')->contains('database'));
+    assert(refusedUrl('redis://host?protocol=4')->contains('2 or 3'));
+    assert(refusedUrl('redis://host?timeout=soon')->contains('duration'));
+    assert(refusedUrl('redis://host?max_reply=10')->contains('1024'));
+    assert(refusedUrl('redis://host?colour=blue')->contains('unknown option'));
+    assert(refusedUrl('redis://:%zz@host')->contains('percent'));
+    assert(refusedUrl('redis://[::1')->contains('bracket'));
+    assert(refusedUrl('unix://')->contains('socket path'));
+}

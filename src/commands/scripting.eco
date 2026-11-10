@@ -1,0 +1,265 @@
+/**
+ * The typed commands for Lua scripts and functions: how each is written (`ScriptCommands`), and the methods that
+ * run them on connections, pools and clusters (`Scripting`) or queue them on pipelines and
+ * transactions (`QueuedScripting`). Generated from one table; keep the three in step.
+ */
+
+namespace redis;
+
+use std::time;
+
+internal struct ScriptCommands
+{
+    /**
+     * A script or function call: its name or source, how many keys, the keys, the arguments.
+     */
+    private static function scripted(string::view $verb, const string& $first, const array<string>& $keys, const array<string>& $args) : Command
+    {
+        Command $c = Command($verb);
+        $c->arg($first)->arg($keys->count() as int64);
+        $c->keys($keys);
+        $c->args($args);
+        return $c;
+    }
+
+    internal static function evalSha(const string& $sha, const array<string>& $keys, const array<string>& $args) : Command
+    {
+        return ScriptCommands::scripted('EVALSHA', $sha, $keys, $args);
+    }
+
+    internal static function scriptLoad(const string& $source) : Command
+    {
+        Command $c = Command('SCRIPT');
+        $c->arg('LOAD');
+        $c->arg($source);
+        return $c;
+    }
+
+    internal static function scriptExists(const array<string>& $shas) : Command
+    {
+        Command $c = Command('SCRIPT');
+        $c->arg('EXISTS');
+        $c->args($shas);
+        return $c;
+    }
+
+    internal static function scriptFlush() : Command
+    {
+        Command $c = Command('SCRIPT');
+        $c->arg('FLUSH');
+        return $c;
+    }
+
+    internal static function fCall(const string& $name, const array<string>& $keys, const array<string>& $args) : Command
+    {
+        return ScriptCommands::scripted('FCALL', $name, $keys, $args);
+    }
+
+    internal static function fCallRo(const string& $name, const array<string>& $keys, const array<string>& $args) : Command
+    {
+        return ScriptCommands::scripted('FCALL_RO', $name, $keys, $args);
+    }
+
+    internal static function functionLoad(const string& $code, bool $replace) : Command
+    {
+        Command $c = Command('FUNCTION');
+        $c->arg('LOAD');
+        if ($replace) {
+            $c->arg('REPLACE');
+        }
+        $c->arg($code);
+        return $c;
+    }
+
+    internal static function functionDelete(const string& $library) : Command
+    {
+        Command $c = Command('FUNCTION');
+        $c->arg('DELETE');
+        $c->arg($library);
+        return $c;
+    }
+
+    internal static function eval(const Script& $script, const array<string>& $keys, const array<string>& $args) : Command
+    {
+        return ScriptCommands::scripted('EVAL', $script->source, $keys, $args);
+    }
+
+    internal static function evalShaOf(const Script& $script, const array<string>& $keys, const array<string>& $args) : Command
+    {
+        return ScriptCommands::scripted('EVALSHA', $script->sha, $keys, $args);
+    }
+}
+
+/**
+ * The commands for Lua scripts and functions, each run as it is called and answered with its reply.
+ */
+public interface Scripting
+{
+    /**
+     * Run the cached script with SHA-1 `$sha`. `NOSCRIPT` when the server does not have it; `eval`
+     * sends it then.
+     */
+    function evalSha(const string& $sha, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>(), by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        Reply $r = try $this->call(ScriptCommands::evalSha($sha, $keys, $args), by: $by);
+        return Decode::reply($r);
+    }
+
+    /**
+     * Cache `$source` on the server, and answer its SHA-1.
+     */
+    function scriptLoad(const string& $source, by: tcp::Deadline? $by = null) : result<string, Error>
+    {
+        Reply $r = try $this->call(ScriptCommands::scriptLoad($source), by: $by);
+        return Decode::bytes($r);
+    }
+
+    /**
+     * For each of `$shas`, whether the server has the script cached.
+     */
+    function scriptExists(const array<string>& $shas, by: tcp::Deadline? $by = null) : result<array<bool>, Error>
+    {
+        Reply $r = try $this->call(ScriptCommands::scriptExists($shas), by: $by);
+        return Decode::flags($r);
+    }
+
+    /**
+     * Drop every cached script.
+     */
+    function scriptFlush(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ScriptCommands::scriptFlush(), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Call the function `$name` from a loaded library (Redis 7).
+     */
+    function fCall(const string& $name, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>(), by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        Reply $r = try $this->call(ScriptCommands::fCall($name, $keys, $args), by: $by);
+        return Decode::reply($r);
+    }
+
+    /**
+     * Call the read-only function `$name`, which a replica may run too.
+     */
+    function fCallRo(const string& $name, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>(), by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        Reply $r = try $this->call(ScriptCommands::fCallRo($name, $keys, $args), by: $by);
+        return Decode::reply($r);
+    }
+
+    /**
+     * Load a library of functions written in Lua, and answer its name. `$replace` replaces one of
+     * the same name.
+     */
+    function functionLoad(const string& $code, replace: bool $replace = false, by: tcp::Deadline? $by = null) : result<string, Error>
+    {
+        Reply $r = try $this->call(ScriptCommands::functionLoad($code, $replace), by: $by);
+        return Decode::bytes($r);
+    }
+
+    /**
+     * Remove the library `$library` and its functions.
+     */
+    function functionDelete(const string& $library, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        try $this->call(ScriptCommands::functionDelete($library), by: $by);
+        return .ok;
+    }
+
+    /**
+     * Run `$script`: by its SHA-1 first, and when the server does not have it cached
+     * (`NOSCRIPT`), with its source, which caches it for next time.
+     */
+    function eval(const Script& $script, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>(), by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        result<Reply, Error> $first = $this->call(ScriptCommands::evalShaOf($script, $keys, $args), by: $by);
+        if ($first->failed() && $first->failure()->is('NOSCRIPT')) {
+            return $this->call(ScriptCommands::eval($script, $keys, $args), by: $by);
+        }
+        return $first;
+    }
+}
+
+/**
+ * The commands for Lua scripts and functions, queued on a pipeline or a transaction, each answered with a
+ * handle to its reply.
+ */
+public interface QueuedScripting
+{
+    /**
+     * Run the cached script with SHA-1 `$sha`. `NOSCRIPT` when the server does not have it; `eval`
+     * sends it then.
+     */
+    function evalSha(const string& $sha, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>()) : Deferred<Reply>
+    {
+        return Deferred<Reply>($this->queue(ScriptCommands::evalSha($sha, $keys, $args)), (const Reply& $r) => Decode::reply($r));
+    }
+
+    /**
+     * Cache `$source` on the server, and answer its SHA-1.
+     */
+    function scriptLoad(const string& $source) : Deferred<string>
+    {
+        return Deferred<string>($this->queue(ScriptCommands::scriptLoad($source)), (const Reply& $r) => Decode::bytes($r));
+    }
+
+    /**
+     * For each of `$shas`, whether the server has the script cached.
+     */
+    function scriptExists(const array<string>& $shas) : Deferred<array<bool>>
+    {
+        return Deferred<array<bool>>($this->queue(ScriptCommands::scriptExists($shas)), (const Reply& $r) => Decode::flags($r));
+    }
+
+    /**
+     * Drop every cached script.
+     */
+    function scriptFlush() : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ScriptCommands::scriptFlush()), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Call the function `$name` from a loaded library (Redis 7).
+     */
+    function fCall(const string& $name, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>()) : Deferred<Reply>
+    {
+        return Deferred<Reply>($this->queue(ScriptCommands::fCall($name, $keys, $args)), (const Reply& $r) => Decode::reply($r));
+    }
+
+    /**
+     * Call the read-only function `$name`, which a replica may run too.
+     */
+    function fCallRo(const string& $name, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>()) : Deferred<Reply>
+    {
+        return Deferred<Reply>($this->queue(ScriptCommands::fCallRo($name, $keys, $args)), (const Reply& $r) => Decode::reply($r));
+    }
+
+    /**
+     * Load a library of functions written in Lua, and answer its name. `$replace` replaces one of
+     * the same name.
+     */
+    function functionLoad(const string& $code, replace: bool $replace = false) : Deferred<string>
+    {
+        return Deferred<string>($this->queue(ScriptCommands::functionLoad($code, $replace)), (const Reply& $r) => Decode::bytes($r));
+    }
+
+    /**
+     * Remove the library `$library` and its functions.
+     */
+    function functionDelete(const string& $library) : Deferred<bool>
+    {
+        return Deferred<bool>($this->queue(ScriptCommands::functionDelete($library)), (const Reply& $r) => Decode::done($r));
+    }
+
+    /**
+     * Run `$script`. Queued with its source (`EVAL`), which never fails as `NOSCRIPT`.
+     */
+    function eval(const Script& $script, const array<string>& $keys = array<string>(), const array<string>& $args = array<string>()) : Deferred<Reply>
+    {
+        return Deferred<Reply>($this->queue(ScriptCommands::eval($script, $keys, $args)), (const Reply& $r) => Decode::reply($r));
+    }
+}

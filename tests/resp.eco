@@ -1,0 +1,450 @@
+/**
+ * The RESP reader without a socket: every type, every reply cut short at every byte, malformed
+ * input, the limits, and random replies encoded and read back.
+ */
+
+/**
+ * `$bytes` decoded whole. Dies when it is short or malformed.
+ */
+internal function decoded(const string& $bytes) : redis::Reply
+{
+    redis::resp::Decoder $d = redis::resp::Decoder($bytes->view());
+    redis::Reply $r = guard $d->reply() else ($e) {
+        die("decode: {$e}");
+    }
+    if ($d->short) {
+        die('decode: short');
+    }
+    if ($d->at != $bytes->size()) {
+        die("decode: stopped at {$d->at} of {$bytes->size()}");
+    }
+    return $r;
+}
+
+/**
+ * The error the decoder has to refuse `$bytes` with. The scanner only finds where a reply ends:
+ * what it lets through is decoded, and refused, after it.
+ */
+internal function refused(const string& $bytes) : redis::Error
+{
+    redis::resp::Decoder $d = redis::resp::Decoder($bytes->view());
+    result<redis::Reply, redis::Error> $r = $d->reply();
+    if (!$r->failed()) {
+        die("decode: '{$bytes}' was not refused");
+    }
+    return $r->failure();
+}
+
+/**
+ * Every prefix of `$bytes` is short to the decoder and not whole to the scanner, which keeps its
+ * place from one prefix to the next as it would between reads; the whole is whole to both.
+ */
+internal function arrivesInPieces(const string& $bytes) : void
+{
+    redis::resp::Scanner $s = redis::resp::Scanner();
+    usize $n = 0;
+    while ($n < $bytes->size()) {
+        string::view $part = $bytes->view()->sub(0, $n);
+        redis::resp::Decoder $d = redis::resp::Decoder($part);
+        redis::Reply $r = guard $d->reply() else ($e) {
+            die("prefix {$n} of '{$bytes}': {$e}");
+        }
+        if (!$d->short) {
+            die("prefix {$n} of '{$bytes}' decoded as whole");
+        }
+        bool $whole = guard $s->step($part, 1073741824) else ($e) {
+            die("scan prefix {$n}: {$e}");
+        }
+        if ($whole) {
+            die("prefix {$n} of '{$bytes}' scanned as whole");
+        }
+        if ($s->want <= $n) {
+            die("prefix {$n}: the scanner wants {$s->want} bytes, no more than it has");
+        }
+        $n++;
+    }
+    bool $done = guard $s->step($bytes->view(), 1073741824) else ($e) {
+        die("scan: {$e}");
+    }
+    assert($done);
+    assert($s->at == $bytes->size());
+    redis::Reply $all = decoded($bytes);
+}
+
+internal function show(const redis::Reply& $r) : string
+{
+    return str::from($r);
+}
+
+test every_resp2_type_decodes
+{
+    assert(show(decoded("+OK\r\n")) == 'OK');
+    assert(decoded("+OK\r\n")->kind() == 'simple');
+    assert((decoded(":42\r\n")->int() ?? 0) == 42);
+    assert((decoded(":-9223372036854775808\r\n")->int() ?? 0) == -9223372036854775807 - 1);
+    assert((decoded("$5\r\nhello\r\n")->text() ?? '') == 'hello');
+    assert((decoded("$0\r\n\r\n")->text() ?? 'x') == '');
+    assert(decoded("$-1\r\n")->isNil());
+    assert(decoded("*-1\r\n")->isNil());
+    assert(show(decoded("*0\r\n")) == '[]');
+    assert(show(decoded("*3\r\n:1\r\n$1\r\na\r\n*1\r\n+x\r\n")) == '[1, "a", [x]]');
+    redis::Reply $e = decoded("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    redis::ServerError $s = guard $e->failure() else {
+        die('no error');
+    }
+    assert($s->code == 'WRONGTYPE');
+    assert($s->message == 'Operation against a key holding the wrong kind of value');
+}
+
+test every_resp3_type_decodes
+{
+    assert(decoded("_\r\n")->isNil());
+    assert((decoded(",3.25\r\n")->float() ?? 0.0) == 3.25);
+    assert((decoded(",-1.5e3\r\n")->float() ?? 0.0) == -1500.0);
+    float64 $inf = decoded(",inf\r\n")->float() ?? 0.0;
+    assert($inf > 1000000000000000000000.0);
+    float64 $ninf = decoded(",-inf\r\n")->float() ?? 0.0;
+    assert($ninf < -1000000000000000000000.0);
+    uint64 $nanBits = mem::bit_cast<uint64, float64>(decoded(",nan\r\n")->float() ?? 0.0);
+    assert((($nanBits >> 52) & 2047) == 2047 && ($nanBits & 4503599627370495) != 0);
+    assert((decoded("#t\r\n")->bool() ?? false));
+    assert(!(decoded("#f\r\n")->bool() ?? true));
+    assert((decoded("(3492890328409238509324850943850943825024385\r\n")->text() ?? '') == '3492890328409238509324850943850943825024385');
+    redis::Reply $v = decoded("=15\r\ntxt:Some string\r\n");
+    assert(($v->text() ?? '') == 'Some string');
+    assert(show(decoded("%2\r\n+a\r\n:1\r\n+b\r\n:2\r\n")) == '{a: 1, b: 2}');
+    assert(show(decoded("~2\r\n+x\r\n+y\r\n")) == '[x, y]');
+    assert(show(decoded(">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$2\r\nhi\r\n")) == '>["message", "ch", "hi"]');
+    redis::Reply $be = decoded("!21\r\nSYNTAX invalid syntax\r\n");
+    assert(($be->failure()?->code ?? '') == 'SYNTAX');
+    assert(($be->failure()?->message ?? '') == 'invalid syntax');
+}
+
+test attributes_are_skipped_wherever_they_are
+{
+    assert((decoded("|1\r\n+key-popularity\r\n%2\r\n$1\r\na\r\n,0.1923\r\n$1\r\nb\r\n,0.0012\r\n*2\r\n:2039123\r\n:9543892\r\n")->items()?->count() ?? 0) == 2);
+    assert(show(decoded("*2\r\n|1\r\n+ttl\r\n:3600\r\n:1\r\n:2\r\n")) == '[1, 2]');
+    assert(show(decoded("|0\r\n+OK\r\n")) == 'OK');
+    arrivesInPieces("*2\r\n|1\r\n+ttl\r\n:3600\r\n:1\r\n:2\r\n");
+}
+
+test a_value_read_out_of_the_buffer_survives_the_buffer_being_reused
+{
+    string $buf = "*2\r\n$11\r\nhello world\r\n-ERR something broke\r\n";
+    $buf = $buf->clone();
+    redis::Reply $r = decoded($buf);
+    // what the reader does once a reply is consumed: the same storage, other bytes
+    $buf->clear();
+    $buf->append(str::repeat('X', 64));
+    array<redis::Reply> $items = $r->items() ?? array<redis::Reply>();
+    assert(($items[0]->text() ?? '') == 'hello world');
+    assert(($items[1]->failure()?->message ?? '') == 'something broke');
+}
+
+test every_reply_cut_short_at_every_byte_is_short_not_wrong
+{
+    array<string> $all = [
+        "+OK\r\n",
+        ":123\r\n",
+        "$5\r\nhello\r\n",
+        "$0\r\n\r\n",
+        "$-1\r\n",
+        "*-1\r\n",
+        "*0\r\n",
+        "*3\r\n:1\r\n$3\r\nabc\r\n*2\r\n+x\r\n_\r\n",
+        "%2\r\n+a\r\n*1\r\n:1\r\n+b\r\n~1\r\n#t\r\n",
+        ">2\r\n+a\r\n+b\r\n",
+        ",1.5\r\n",
+        "(123\r\n",
+        "=7\r\ntxt:abc\r\n",
+        "!3\r\nERR\r\n",
+        "-ERR x\r\n",
+    ];
+    // a payload with CRLF, NUL and a byte that is no UTF-8 inside it
+    string $binary = "$12\r\nbinary\r\n\0";
+    $binary->push(255);
+    $binary->append("\r\n\r\n");
+    $all->push($binary);
+    foreach ($all as const &$bytes) {
+        arrivesInPieces($bytes);
+    }
+}
+
+test malformed_replies_are_refused
+{
+    assert(refused("?\r\n")->name() == 'malformed');
+    assert(refused(":12a\r\n")->name() == 'malformed');
+    assert(refused(":\r\n")->name() == 'malformed');
+    assert(refused(":99999999999999999999\r\n")->name() == 'malformed');
+    assert(refused("$abc\r\n")->name() == 'malformed');
+    assert(refused("$-2\r\n")->name() == 'malformed');
+    assert(refused("$3\r\nabcXY")->name() == 'malformed');
+    assert(refused("*-2\r\n")->name() == 'malformed');
+    assert(refused("+OK\rX")->name() == 'malformed');
+    assert(refused("#x\r\n")->name() == 'malformed');
+    assert(refused("_x\r\n")->name() == 'malformed');
+    assert(refused(",fast\r\n")->name() == 'malformed');
+    assert(refused("(12x\r\n")->name() == 'malformed');
+    assert(refused("=2\r\nab\r\n")->name() == 'malformed');
+    // a streamed aggregate (`*?`) is never sent by Redis
+    assert(refused("*?\r\n")->name() == 'malformed');
+}
+
+test nesting_past_the_limit_is_refused
+{
+    string $deep = str::repeat("*1\r\n", 70);
+    $deep->append(":1\r\n");
+    redis::resp::Decoder $d = redis::resp::Decoder($deep->view());
+    assert($d->reply()->failure()->name() == 'malformed');
+    redis::resp::Scanner $s = redis::resp::Scanner();
+    assert($s->step($deep->view(), 1048576)->failure()->name() == 'malformed');
+
+    string $ok = str::repeat("*1\r\n", 60);
+    $ok->append(":1\r\n");
+    redis::Reply $r = decoded($ok);
+}
+
+test a_reply_over_the_limit_is_too_large_before_it_is_read
+{
+    redis::resp::Scanner $s = redis::resp::Scanner();
+    redis::Error $big = $s->step("$2000000\r\n"->view(), 1048576)->failure();
+    assert($big->name() == 'tooLarge');
+    redis::resp::Scanner $s2 = redis::resp::Scanner();
+    redis::Error $many = $s2->step("*900000000\r\n"->view(), 1048576)->failure();
+    assert($many->name() == 'tooLarge');
+    // a huge count with few bytes behind it is short to the decoder: nothing is allocated
+    redis::resp::Decoder $d = redis::resp::Decoder("*900000000\r\n:1\r\n"->view());
+    redis::Reply $r = guard $d->reply() else ($e) {
+        die("{$e}");
+    }
+    assert($d->short);
+}
+
+test the_scanner_asks_for_a_whole_bulk_payload_at_once
+{
+    redis::resp::Scanner $s = redis::resp::Scanner();
+    string $head = "$100000\r\nabc";
+    assert(!$s->step($head->view(), 1048576)->unwrap());
+    assert($s->want == 9 + 100000 + 2);
+}
+
+/**
+ * A tiny deterministic generator, so a failing case can be found again.
+ */
+internal class Dice
+{
+    internal uint64 $state;
+
+    internal constructor(uint64 $seed)
+    {
+        $this->state = $seed;
+    }
+
+    internal function below(uint64 $n) : uint64
+    {
+        $this->state = $this->state * 6364136223846793005 + 1442695040888963407;
+        return ($this->state >> 33) % $n;
+    }
+}
+
+/**
+ * A random reply, nested up to `$depth` more levels.
+ */
+internal function randomReply(Dice $d, uint32 $depth) : redis::Reply
+{
+    uint64 $kind = $d->below(12);
+    if ($depth == 0 && $kind >= 8) {
+        $kind = $kind - 8;
+    }
+    if ($kind == 0) {
+        return redis::Reply::simple("s{$d->below(1000)}");
+    }
+    if ($kind == 1) {
+        int64 $n = ($d->below(2000000) as int64) - 1000000;
+        return redis::Reply::int($n);
+    }
+    if ($kind == 2) {
+        string $bytes = '';
+        uint64 $len = $d->below(40);
+        uint64 $i = 0;
+        while ($i < $len) {
+            $bytes->push($d->below(256) as uint8);
+            $i++;
+        }
+        return redis::Reply::bulk($bytes);
+    }
+    if ($kind == 3) {
+        return redis::Reply::nil;
+    }
+    if ($kind == 4) {
+        return redis::Reply::double((($d->below(100000) as int64) - 50000) as float64 / 8.0);
+    }
+    if ($kind == 5) {
+        return redis::Reply::bool($d->below(2) == 1);
+    }
+    if ($kind == 6) {
+        return redis::Reply::error(redis::ServerError('ERR', "e{$d->below(50)}"));
+    }
+    if ($kind == 7) {
+        return redis::Reply::verbatim('txt', "v{$d->below(50)}");
+    }
+    uint64 $count = $d->below(5);
+    array<redis::Reply> $items = array<redis::Reply>();
+    uint64 $j = 0;
+    while ($j < $count) {
+        $items->push(randomReply($d, $depth - 1));
+        $j++;
+    }
+    if ($kind == 8) {
+        return redis::Reply::array($items);
+    }
+    if ($kind == 9) {
+        return redis::Reply::set($items);
+    }
+    if ($kind == 10) {
+        return redis::Reply::push($items);
+    }
+    array<redis::Pair> $pairs = array<redis::Pair>();
+    uint64 $k = 0;
+    while ($k < $count) {
+        $pairs->push(redis::Pair(redis::Reply::simple("k{$k}"), randomReply($d, $depth - 1)));
+        $k++;
+    }
+    return redis::Reply::map($pairs);
+}
+
+/**
+ * `$r` as RESP3, the way a server writes it.
+ */
+internal function encode(const redis::Reply& $r, string& $out) : void
+{
+    match ($r) {
+        redis::Reply::simple($t) => {
+            $out->append("+{$t}\r\n");
+        },
+        redis::Reply::error($e) => {
+            string $line = str::from($e);
+            $out->append("!{$line->size()}\r\n{$line}\r\n");
+        },
+        redis::Reply::int($n) => {
+            $out->append(":{$n}\r\n");
+        },
+        redis::Reply::bulk($b) => {
+            $out->append("${$b->size()}\r\n");
+            $out->append($b);
+            $out->append("\r\n");
+        },
+        redis::Reply::nil => {
+            $out->append("_\r\n");
+        },
+        redis::Reply::double($x) => {
+            string $text = redis::floatArg($x);
+            $out->append(",{$text}\r\n");
+        },
+        redis::Reply::bool($b) => {
+            if ($b) {
+                $out->append("#t\r\n");
+            } else {
+                $out->append("#f\r\n");
+            }
+        },
+        redis::Reply::big($digits) => {
+            $out->append("({$digits}\r\n");
+        },
+        redis::Reply::verbatim($f, $t) => {
+            usize $size = $t->size() + 4;
+            $out->append("={$size}\r\n{$f}:{$t}\r\n");
+        },
+        redis::Reply::array($a) => {
+            encodeAll("*", $a, $out);
+        },
+        redis::Reply::set($s) => {
+            encodeAll("~", $s, $out);
+        },
+        redis::Reply::push($p) => {
+            encodeAll(">", $p, $out);
+        },
+        redis::Reply::map($m) => {
+            $out->append("%{$m->count()}\r\n");
+            foreach ($m as const &$p) {
+                encode($p->key, $out);
+                encode($p->value, $out);
+            }
+        },
+    }
+}
+
+internal function encodeAll(const string& $type, const array<redis::Reply>& $items, string& $out) : void
+{
+    $out->append("{$type}{$items->count()}\r\n");
+    foreach ($items as const &$item) {
+        encode($item, $out);
+    }
+}
+
+test random_replies_read_back_as_they_were_written
+{
+    Dice $d = Dice(20261106);
+    int32 $i = 0;
+    while ($i < 400) {
+        redis::Reply $r = randomReply($d, 4);
+        string $bytes = '';
+        encode($r, $bytes);
+        redis::Reply $back = decoded($bytes);
+        if (show($back) != show($r)) {
+            die("case {$i}: wrote {$r}, read {$back}");
+        }
+        if ($i % 20 == 0) {
+            arrivesInPieces($bytes);
+        }
+        $i++;
+    }
+}
+
+test a_command_encodes_its_arguments_binary_safe
+{
+    redis::Command $c = redis::Command('SET');
+    string $value = "a\r\nb\0c";
+    $c->key('k')->arg($value)->arg('PX')->arg(1500);
+    assert($c->wire() == "*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$6\r\na\r\nb\0c\r\n$2\r\nPX\r\n$4\r\n1500\r\n");
+    assert($c->count() == 5);
+    assert($c->name() == 'SET');
+    array<string> $args = $c->args();
+    assert($args->count() == 5 && $args[2] == $value);
+    redis::Command $empty = redis::Command(['ECHO', '']);
+    assert($empty->wire() == "*2\r\n$4\r\nECHO\r\n$0\r\n\r\n");
+    redis::Command $f = redis::Command('ZADD');
+    $f->arg(1.5)->arg(-0.25)->arg(3.0)->arg(mem::bit_cast<float64, uint64>(9218868437227405312));
+    assert($f->args()[1] == '1.5' && $f->args()[2] == '-0.25' && $f->args()[3] == '3' && $f->args()[4] == 'inf');
+    redis::Command $third = redis::Command('X');
+    $third->arg(0.1);
+    assert((str::float($third->args()[1]) ?? 0.0) == 0.1);
+}
+
+test a_command_knows_the_slot_of_its_keys
+{
+    redis::Command $none = redis::Command(['PING']);
+    assert($none->slot() == null && !$none->keyed() && !$none->crossSlot());
+    redis::Command $one = redis::Command('GET');
+    $one->key('foo');
+    assert(($one->slot() ?? 0) == 12182);
+    redis::Command $tagged = redis::Command('MGET');
+    $tagged->keys(['{user1}:a', '{user1}:b']);
+    assert(($tagged->slot() ?? 0) == redis::Cluster::slot('user1'));
+    redis::Command $spread = redis::Command('MGET');
+    $spread->keys(['a', 'b']);
+    assert($spread->crossSlot() && $spread->slot() == null);
+    // an empty tag, or one never closed, hashes the whole key
+    assert(redis::Cluster::slot('{}x') != redis::Cluster::slot('x'));
+    assert(redis::Cluster::slot('{x') == redis::Cluster::slot('{x'));
+    assert(redis::Cluster::slot('a{b}c{d}') == redis::Cluster::slot('b'));
+    assert(redis::Cluster::slot('123456789') == 12739);
+}
+
+test a_long_chain_of_attributes_is_decoded_without_recursion
+{
+    // each attribute annotates the next one: a stack frame apiece would run out long before this
+    string $chain = str::repeat("|0\r\n", 1000000);
+    $chain->append(":1\r\n");
+    assert(show(decoded($chain)) == '1');
+}

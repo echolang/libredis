@@ -1,0 +1,24 @@
+/*
+ * libredis: a Redis client for Echo.
+ *
+ * RESP2 and RESP3 are written in Echo over libtcp: HELLO and AUTH (ACL users too), typed commands
+ * for strings, keys, hashes, lists, sets, sorted sets, streams and the rest, pipelines,
+ * MULTI/EXEC transactions with WATCH, Lua scripts and functions, Pub/Sub, a connection pool and
+ * cluster routing with MOVED/ASK redirects. SHA-1 comes from libcrypto. No C, no hiredis, no TLS
+ * yet.
+ */
+
+#[module: "libredis"]
+#[version: "0.1.0"] // x-release-please-version
+#[epm::license: "MIT"]
+#[epm::description: "a redis client for echolang, written in echo over libtcp"]
+
+#[requires: "echolang/libtcp" { version: "^0.2", source: git "https://github.com/echolang/libtcp" }]
+#[requires: "echolang/libcrypto" { version: "^0.3.3", source: git "https://github.com/echolang/libcrypto" }]
+
+#[sources: ["src/*.eco", "src/resp/*.eco", "src/commands/*.eco", "src/cluster/*.eco"]]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+    #[depends: "../ecotest"]
+}

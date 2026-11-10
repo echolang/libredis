@@ -1,0 +1,1068 @@
+namespace redis;
+
+use std::thread;
+use std::time;
+
+// a slot no known node serves
+internal const uint32 NO_NODE = 4294967295;
+
+/**
+ * How a cluster client routes. Plain data.
+ */
+public struct ClusterOptions
+{
+    /**
+     * How often one command may be sent on to another node (`MOVED`, `ASK`) or tried again
+     * (`TRYAGAIN`, `CLUSTERDOWN`) before it is `.unroutable`.
+     */
+    public uint32 $maxRedirects = 5;
+
+    /**
+     * The pool each primary gets.
+     */
+    public PoolOptions $pool = PoolOptions();
+}
+
+/**
+ * Where a command's keys are in its arguments, as `COMMAND INFO` tells: the first, the last
+ * (negative counts from the end) and the step. `movable` keys can only be asked for.
+ */
+internal struct KeySpec
+{
+    internal int64 $first;
+    internal int64 $last;
+    internal int64 $step;
+    internal bool $movable;
+
+    /**
+     * From a `COMMAND INFO` entry: `[name, arity, flags, first, last, step, ...]`. An unknown
+     * command has no keys.
+     */
+    internal static function parse(const Reply& $r) : KeySpec
+    {
+        KeySpec $none = KeySpec(0, 0, 0, false);
+        array<Reply> $all = $r->items() ?? array<Reply>();
+        if ($all->empty()) {
+            return $none;
+        }
+        array<Reply> $entry = $all[0]->items() ?? array<Reply>();
+        if ($entry->count() < 6) {
+            return $none;
+        }
+        bool $movable = false;
+        array<Reply> $flags = $entry[2]->items() ?? array<Reply>();
+        foreach ($flags as const &$flag) {
+            if (($flag->text() ?? '') == 'movablekeys') {
+                $movable = true;
+            }
+        }
+        return KeySpec($entry[3]->int() ?? 0, $entry[4]->int() ?? 0, $entry[5]->int() ?? 0, $movable);
+    }
+
+    /**
+     * The keys among `$args`, the command's name being `$args[0]`.
+     */
+    internal const function pick(const array<string>& $args) : array<string>
+    {
+        array<string> $out = array<string>();
+        if ($this->first <= 0 || $this->step <= 0) {
+            return $out;
+        }
+        int64 $n = $args->count() as int64;
+        int64 $last = $this->last;
+        if ($last < 0) {
+            $last = $n + $last;
+        }
+        int64 $i = $this->first;
+        while ($i <= $last && $i < $n) {
+            $out->push($args[$i as usize]);
+            $i = $i + $this->step;
+        }
+        return $out;
+    }
+}
+
+internal struct ClusterState
+{
+    // the node serving each slot, as an index into nodes
+    internal array<uint32> $slots;
+    internal array<Pool> $nodes;
+    internal map<string, uint32> $byAddress;
+    internal map<string, KeySpec> $specs;
+    internal uint64 $turn = 0;
+    internal bool $closed = false;
+}
+
+#[docs::groups: ["Opening", "Commands", "Pipelines and transactions", "Pub/Sub"]]
+
+/**
+ * A Redis cluster: every typed command goes to the primary that serves its key's slot, and is
+ * sent on when the cluster says the slot moved (`MOVED`) or is moving (`ASK`). Each primary gets
+ * a `Pool`; the cluster may be shared by any number of threads.
+ *
+ * ```echo
+ * redis::Cluster $c = guard redis::Cluster::open(['10.0.0.1:7000', '10.0.0.2:7000'], $options);
+ * guard $c->set('user:{42}:name', 'Ada');
+ * ```
+ *
+ * One command's keys have to share a slot; a `{tag}` in the key names makes them. Primaries only:
+ * replicas are not read from.
+ *
+ * A command without keys goes to any one primary (`PING`, `INFO`), or to every one of them when
+ * each needs it: `FLUSHDB`, `FLUSHALL`, `SCRIPT LOAD` and `FLUSH`, `FUNCTION LOAD`, `DELETE`,
+ * `FLUSH` and `RESTORE`. The ones that would answer for one primary as if it were the whole
+ * cluster (`KEYS`, `SCAN`, `DBSIZE`, `RANDOMKEY`) are refused; run them on each of `primaries()`.
+ *
+ * ```echo
+ * foreach ($c->primaries() as $node) {
+ *     int64 $n = guard $node->dbSize();
+ * }
+ * ```
+ */
+#[atomic]
+public class Cluster : Caller, Runner, Atomic, Strings, Keys, Hashes, Lists, Sets, SortedSets, Streams, Scripting, Server
+{
+    /**
+     * The options every node's connections start from: credentials, timeouts. Host and port come
+     * from the cluster, and the database is always 0.
+     */
+    #[docs::group: "Opening"]
+    public const Options $options;
+
+    #[docs::group: "Opening"]
+    public const ClusterOptions $limits;
+
+    private const array<string> $seeds;
+    private thread::mutex<ClusterState> $state;
+    // held while the slot map is learned again, so threads redirected together ask once
+    private thread::mutex<uint64> $learning;
+
+    internal constructor(array<string> $seeds, Options $options, ClusterOptions $limits)
+    {
+        $this->seeds = $seeds;
+        $this->options = $options;
+        $this->limits = $limits;
+        array<uint32> $none = arr::room<uint32>(SLOTS as usize);
+        usize $i = 0;
+        while ($i < SLOTS as usize) {
+            $none->push(NO_NODE);
+            $i++;
+        }
+        $this->state = thread::mutex<ClusterState>(ClusterState($none, array<Pool>(), map<string, uint32>(), map<string, KeySpec>(), 0, false));
+        $this->learning = thread::mutex<uint64>(0);
+    }
+
+    /**
+     * Connect to a cluster through any of `$seeds` (`host:port`), and learn which primary serves
+     * which slot.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const array<string>& $seeds, Options $options = Options(), ClusterOptions $limits = ClusterOptions()) : result<Cluster, Error>
+    {
+        if ($seeds->empty()) {
+            return .error(.invalid('a cluster needs at least one seed address'));
+        }
+        foreach ($seeds as const &$s) {
+            try splitAddress($s);
+        }
+        $options->database = 0;
+        $options->socket = null;
+        Cluster $c = Cluster($seeds, $options, $limits);
+        guard $c->refresh(tcp::Deadline(after: $options->connectTimeout)) else ($e) {
+            $c->close();
+            return .error($e);
+        }
+        return .ok($c);
+    }
+
+    /**
+     * The hash slot of `$key`: CRC16 of the key, or of its `{tag}` when it has one, modulo 16384.
+     */
+    #[docs::group: "Commands"]
+    public static function slot(string::view $key) : uint16
+    {
+        return hashSlot($key);
+    }
+
+    /**
+     * The primaries known now, as `host:port`.
+     */
+    #[docs::group: "Opening"]
+    public function nodes() : array<string>
+    {
+        thread::locked<ClusterState> $s = $this->state->lock();
+        array<string> $out = arr::room<string>($s->value->nodes->count());
+        foreach ($s->value->byAddress as $address => const &$i) {
+            $out->push($address);
+        }
+        return $out;
+    }
+
+    /**
+     * The pool of every primary that serves a slot now, for what has to run on each of them:
+     * `scan`, `keys`, `dbSize`.
+     */
+    #[docs::group: "Opening"]
+    public function primaries() : array<Pool>
+    {
+        thread::locked<ClusterState> $s = $this->state->lock();
+        array<bool> $serving = arr::room<bool>($s->value->nodes->count());
+        usize $i = 0;
+        while ($i < $s->value->nodes->count()) {
+            $serving->push(false);
+            $i++;
+        }
+        foreach ($s->value->slots as $node) {
+            if ($node != NO_NODE) {
+                $serving[$node as usize] = true;
+            }
+        }
+        array<Pool> $out = array<Pool>();
+        $i = 0;
+        while ($i < $serving->count()) {
+            if ($serving[$i]) {
+                $out->push($s->value->nodes[$i]);
+            }
+            $i++;
+        }
+        return $out;
+    }
+
+    /**
+     * Close every node's pool.
+     */
+    #[docs::group: "Opening"]
+    public function close() : void
+    {
+        array<Pool> $pools = array<Pool>();
+        {
+            thread::locked<ClusterState> $s = $this->state->lock();
+            $s->value->closed = true;
+            $pools = $s->value->nodes;
+        }
+        foreach ($pools as $p) {
+            $p->close();
+        }
+    }
+
+    /**
+     * Run one command on the primary that serves its keys. A keyless command goes to any one
+     * primary, or to every one when each needs it; `KEYS`, `SCAN`, `DBSIZE` and `RANDOMKEY` are
+     * `.unroutable` (see `primaries`).
+     */
+    #[docs::group: "Commands"]
+    public function call(const Command& $command, by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        tcp::Deadline $until = $this->options->deadline($by, $command->blocks());
+        if (!$command->keyed()) {
+            match (reach($command)) {
+                Reach::refused => {
+                    return .error(refusal($command));
+                },
+                Reach::everyPrimary => {
+                    return $this->broadcast($command, $until);
+                },
+                Reach::anyPrimary => {},
+            }
+        }
+        int32 $slot = try $this->slotFor($command, $until);
+        return $this->route($command, $slot, $until);
+    }
+
+    /**
+     * Run a command given as its name and arguments. Its keys are found from the server's
+     * command table.
+     */
+    #[docs::group: "Commands"]
+    public function call(const array<string>& $args, by: tcp::Deadline? $by = null) : result<Reply, Error>
+    {
+        Command $c = Command($args);
+        return $this->call($c, by: $by);
+    }
+
+    /**
+     * A pipeline: its commands go to their nodes, one write per node, and the replies come back
+     * in the order they were queued.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function pipeline() : Pipeline
+    {
+        return Pipeline($this);
+    }
+
+    /**
+     * A transaction. Its keys all have to share one slot: it runs on the primary serving it.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function multi() : Transaction
+    {
+        return Transaction($this);
+    }
+
+    /**
+     * `Connection::optimistic` on the primary serving `$keys`, which have to share one slot.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function optimistic(const array<string>& $keys, function<status<Error>(Connection, Transaction)> $work, uint32 $attempts = 3, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        Command $probe = Command('WATCH');
+        $probe->keys($keys);
+        if ($probe->crossSlot()) {
+            return .error(.crossSlot);
+        }
+        uint16 $slot = $probe->slot() ?? 0;
+        Pool $node = try $this->nodeFor($slot as int32);
+        Lease $l = try $node->acquire(by: $by);
+        return $l->db()->optimistic($keys, $work, $attempts, by: $by);
+    }
+
+    /**
+     * Nothing to let go of: a cluster's transactions watch nothing.
+     */
+    #[docs::group: "Pipelines and transactions"]
+    public function unwatch(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return .ok;
+    }
+
+    /**
+     * A subscriber for channels and patterns. Classic Pub/Sub spans the whole cluster, so any
+     * node will do.
+     */
+    #[docs::group: "Pub/Sub"]
+    public function subscriber(by: tcp::Deadline? $by = null) : result<Subscriber, Error>
+    {
+        Pool $node = try $this->nodeFor(-1);
+        return Subscriber::open($node->options);
+    }
+
+    /**
+     * A subscriber on the primary serving the shard channel `$channel` (Redis 7), for
+     * `ssubscribe` to it and to others in its slot.
+     */
+    #[docs::group: "Pub/Sub"]
+    public function shardSubscriber(const string& $channel, by: tcp::Deadline? $by = null) : result<Subscriber, Error>
+    {
+        Pool $node = try $this->nodeFor(hashSlot($channel) as int32);
+        return Subscriber::open($node->options);
+    }
+
+    /**
+     * Send `$command` to the node serving `$slot` (-1: any), following redirects.
+     */
+    private function route(const Command& $command, int32 $slot, tcp::Deadline $until) : result<Reply, Error>
+    {
+        uint32 $tries = 0;
+        HostPort? $asking = null;
+        while (true) {
+            Pool $node = try $this->pick($slot, $asking);
+            Lease $l = guard $node->acquire(by: $until) else ($e) {
+                // nothing was sent: the node may be gone, so look again and try once more
+                if ($tries >= $this->limits->maxRedirects || $until->passed()) {
+                    return .error($e);
+                }
+                $tries++;
+                status<Error> $seen = $this->refresh($until);
+                continue;
+            }
+            Connection $db = $l->db();
+            if ($asking != null) {
+                try $db->call(Command('ASKING'), by: $until);
+            }
+            result<Reply, Error> $r = $db->call($command, by: $until);
+            if (!$r->failed()) {
+                return $r;
+            }
+            Error $e = $r->failure();
+            ServerError $s = guard $e->server() else {
+                return $r;
+            }
+            $asking = null;
+            if ($s->code == 'MOVED') {
+                guard $this->moved($s, $node->options->host, $until) else ($me) {
+                    return .error($me);
+                }
+            } else if ($s->code == 'ASK') {
+                Redirect $to = guard Redirect::parse($s, $node->options->host) else ($pe) {
+                    return .error($pe);
+                }
+                $asking = $to->node;
+            } else if ($s->code == 'TRYAGAIN' || $s->code == 'CLUSTERDOWN') {
+                $this->pause($tries, $until);
+                if ($s->code == 'CLUSTERDOWN') {
+                    status<Error> $seen = $this->refresh($until);
+                }
+            } else {
+                return $r;
+            }
+            $tries++;
+            if ($tries > $this->limits->maxRedirects) {
+                return .error(.unroutable("redirected more than {$this->limits->maxRedirects} times: {$s->code} {$s->message}"));
+            }
+        }
+    }
+
+    /**
+     * A `MOVED` from a node on `$asked`: that slot is served elsewhere now. The rest of the map is
+     * learned again, since a moved slot rarely moves alone, unless the map already sends the slot
+     * where the redirect says (another thread learned it first). The redirect itself is the
+     * freshest word on its slot, so it goes on top of whatever the node asked still believes.
+     */
+    private function moved(const ServerError& $s, const string& $asked, tcp::Deadline $until) : status<Error>
+    {
+        Redirect $to = try Redirect::parse($s, $asked);
+        // no longer than a connect would take, and never past the caller's deadline
+        time::duration $left = remainingOr($until, $this->options->connectTimeout);
+        if ($left > $this->options->connectTimeout) {
+            $left = $this->options->connectTimeout;
+        }
+        tcp::Deadline $soon = tcp::Deadline(after: $left);
+        {
+            thread::locked<uint64> $l = $this->learning->lock();
+            if (!$this->agrees($to)) {
+                status<Error> $seen = $this->learn($soon);
+                $l->value = $l->value + 1;
+            }
+        }
+        {
+            thread::locked<ClusterState> $st = $this->state->lock();
+            uint32 $node = $this->ensureNode($st->value, $to->node);
+            $st->value->slots[$to->slot as usize] = $node;
+        }
+        return .ok;
+    }
+
+    /**
+     * True when the map already sends the redirect's slot to the node it names.
+     */
+    private function agrees(const Redirect& $to) : bool
+    {
+        thread::locked<ClusterState> $s = $this->state->lock();
+        if (!$s->value->byAddress->has($to->address)) {
+            return false;
+        }
+        return $s->value->slots[$to->slot as usize] == $s->value->byAddress[$to->address];
+    }
+
+    /**
+     * Wait a little before trying again, longer each time, never past the deadline.
+     */
+    private function pause(uint32 $tries, tcp::Deadline $until) : void
+    {
+        int64 $ms = 10;
+        uint32 $i = 0;
+        while ($i < $tries && $ms < 500) {
+            $ms = $ms * 2;
+            $i++;
+        }
+        time::duration? $left = $until->remaining();
+        if ($left != null) {
+            time::duration $l = guard $left;
+            if ($l->as_millis() < $ms) {
+                $ms = $l->as_millis();
+            }
+        }
+        if ($ms > 0) {
+            time::sleep(time::duration::millis($ms));
+        }
+    }
+
+    /**
+     * The pool for a slot (-1: the next node in turn), or for the address an `ASK` named.
+     */
+    private function pick(int32 $slot, HostPort? $asking) : result<Pool, Error>
+    {
+        if ($asking != null) {
+            HostPort $there = guard $asking;
+            thread::locked<ClusterState> $s = $this->state->lock();
+            uint32 $i = $this->ensureNode($s->value, $there);
+            return .ok($s->value->nodes[$i as usize]);
+        }
+        return $this->nodeFor($slot);
+    }
+
+    private function nodeFor(int32 $slot) : result<Pool, Error>
+    {
+        thread::locked<ClusterState> $s = $this->state->lock();
+        if ($s->value->closed) {
+            return .error(.closed);
+        }
+        if ($s->value->nodes->empty()) {
+            return .error(.unroutable('no cluster node is known'));
+        }
+        if ($slot < 0) {
+            $s->value->turn = $s->value->turn + 1;
+            usize $any = ($s->value->turn % ($s->value->nodes->count() as uint64)) as usize;
+            return .ok($s->value->nodes[$any]);
+        }
+        uint32 $i = $s->value->slots[$slot as usize];
+        if ($i == NO_NODE) {
+            return .error(.unroutable("no node serves slot {$slot}"));
+        }
+        return .ok($s->value->nodes[$i as usize]);
+    }
+
+    /**
+     * The index of the node at `$hp`, added with a pool of its own when it is new. Called with the
+     * lock held.
+     */
+    private function ensureNode(ClusterState& $s, const HostPort& $hp) : uint32
+    {
+        string $address = joinAddress($hp->host, $hp->port as int64);
+        if ($s->byAddress->has($address)) {
+            return $s->byAddress[$address];
+        }
+        Options $o = $this->options;
+        $o->host = $hp->host;
+        $o->port = $hp->port;
+        uint32 $i = $s->nodes->count() as uint32;
+        $s->nodes->push(Pool($o, $this->limits->pool));
+        $s->byAddress[$address] = $i;
+        return $i;
+    }
+
+    /**
+     * Learn the slot map again, one thread at a time.
+     */
+    internal function refresh(tcp::Deadline $until) : status<Error>
+    {
+        thread::locked<uint64> $l = $this->learning->lock();
+        $l->value = $l->value + 1;
+        return $this->learn($until);
+    }
+
+    /**
+     * Ask for the slot map, from the first node that answers: the known nodes over their pools,
+     * then the seeds that are not among them, on a connection of their own. Called with
+     * `learning` held.
+     */
+    private function learn(tcp::Deadline $until) : status<Error>
+    {
+        array<Pool> $known = array<Pool>();
+        array<string> $seeds = array<string>();
+        {
+            thread::locked<ClusterState> $s = $this->state->lock();
+            $known = $s->value->nodes;
+            foreach ($this->seeds as const &$seed) {
+                if (!$s->value->byAddress->has($seed)) {
+                    $seeds->push($seed);
+                }
+            }
+        }
+        Error $last = .unroutable('no cluster node answered');
+        foreach ($known as $pool) {
+            if ($until->passed()) {
+                return .error($last);
+            }
+            if ($this->adopt($pool->call(Command(['CLUSTER', 'SLOTS']), by: $until), $pool->options->host, $last)) {
+                return .ok;
+            }
+        }
+        foreach ($seeds as const &$address) {
+            HostPort $hp = guard splitAddress($address) else ($e) {
+                $last = $e;
+                continue;
+            }
+            Options $o = $this->options;
+            $o->host = $hp->host;
+            $o->port = $hp->port;
+            $o->connectTimeout = remainingOr($until, $o->connectTimeout);
+            result<Connection, Error> $opened = Connection::open($o);
+            if ($opened->failed()) {
+                $last = $opened->failure();
+                continue;
+            }
+            Connection $db = $opened->unwrap();
+            result<Reply, Error> $got = $db->call(Command(['CLUSTER', 'SLOTS']), by: $until);
+            $db->close();
+            if ($this->adopt($got, $hp->host, $last)) {
+                return .ok;
+            }
+        }
+        return .error($last);
+    }
+
+    /**
+     * Apply a `CLUSTER SLOTS` reply asked of `$host`. False, with the reason in `$last`, when
+     * there was none or it did not read.
+     */
+    private function adopt(result<Reply, Error> $got, const string& $host, Error& $last) : bool
+    {
+        Reply $r = guard $got else ($e) {
+            $last = $e;
+            return false;
+        }
+        guard $this->apply($r, $host) else ($e) {
+            $last = $e;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Put the slot map from a `CLUSTER SLOTS` reply in place of the one known, when it reads.
+     */
+    private function apply(const Reply& $slots, const string& $asked) : status<Error>
+    {
+        array<SlotRange> $ranges = try SlotRange::parse($slots, $asked);
+        thread::locked<ClusterState> $s = $this->state->lock();
+        usize $i = 0;
+        while ($i < $s->value->slots->count()) {
+            $s->value->slots[$i] = NO_NODE;
+            $i++;
+        }
+        foreach ($ranges as const &$r) {
+            uint32 $node = $this->ensureNode($s->value, $r->node);
+            uint32 $slot = $r->start;
+            while ($slot <= $r->end) {
+                $s->value->slots[$slot as usize] = $node;
+                $slot++;
+            }
+        }
+        return .ok;
+    }
+
+    /**
+     * Run a command on every primary, one after the other. The first failure stops it; otherwise
+     * the first primary's reply is the answer.
+     */
+    private function broadcast(const Command& $command, tcp::Deadline $until) : result<Reply, Error>
+    {
+        array<Pool> $all = $this->primaries();
+        if ($all->empty()) {
+            return .error(.unroutable('no primary serves a slot'));
+        }
+        Reply $first = try $all[0]->call($command, by: $until);
+        usize $i = 1;
+        while ($i < $all->count()) {
+            try $all[$i]->call($command, by: $until);
+            $i++;
+        }
+        return .ok(mv $first);
+    }
+
+    /**
+     * The slot of a command's keys: those it marked, or those the server's command table says
+     * are keys. -1 for a keyless command.
+     */
+    private function slotFor(const Command& $command, tcp::Deadline $until) : result<int32, Error>
+    {
+        if ($command->crossSlot()) {
+            return .error(.crossSlot);
+        }
+        uint16? $marked = $command->slot();
+        if ($marked != null) {
+            uint16 $m = guard $marked;
+            return .ok($m as int32);
+        }
+        array<string> $args = $command->args();
+        if ($args->count() < 2) {
+            return .ok(-1);
+        }
+        array<string> $keys = try $this->keysOf($args, $until);
+        int32 $slot = -1;
+        foreach ($keys as const &$k) {
+            int32 $s = hashSlot($k) as int32;
+            if ($slot >= 0 && $s != $slot) {
+                return .error(.crossSlot);
+            }
+            $slot = $s;
+        }
+        return .ok($slot);
+    }
+
+    /**
+     * The keys among `$args`, by the command's entry in `COMMAND INFO` (cached), or by
+     * `COMMAND GETKEYS` for a command whose keys move about (`EVAL`, `ZUNIONSTORE`).
+     */
+    private function keysOf(const array<string>& $args, tcp::Deadline $until) : result<array<string>, Error>
+    {
+        string $name = str::lower($args[0]);
+        KeySpec? $known = null;
+        {
+            thread::locked<ClusterState> $s = $this->state->lock();
+            if ($s->value->specs->has($name)) {
+                $known = $s->value->specs[$name];
+            }
+        }
+        if ($known == null) {
+            Command $info = Command(['COMMAND', 'INFO', $name]);
+            Reply $r = try $this->route($info, -1, $until);
+            KeySpec $spec = KeySpec::parse($r);
+            {
+                thread::locked<ClusterState> $s = $this->state->lock();
+                $s->value->specs[$name] = $spec;
+            }
+            $known = $spec;
+        }
+        KeySpec $spec = guard $known;
+        if ($spec->movable) {
+            Command $ask = Command(['COMMAND', 'GETKEYS']);
+            $ask->args($args);
+            Reply $keys = guard $this->route($ask, -1, $until) else ($e) {
+                // a command with no keys this time (EVAL with numkeys 0) is refused as such
+                if ($e->is('ERR')) {
+                    return .ok(array<string>());
+                }
+                return .error($e);
+            }
+            return Decode::texts($keys);
+        }
+        return .ok($spec->pick($args));
+    }
+
+    internal function exchange(Batch $batch, tcp::Deadline? $by) : void
+    {
+        // for finding the keys; the batch itself goes with the caller's deadline, or with none so
+        // each connection allows for its blocking commands
+        tcp::Deadline $until = $this->options->deadline($by, null);
+        usize $count = $batch->commands->count();
+        // which node each command goes to, and the commands of each node in order
+        map<string, array<usize>> $byNode = map<string, array<usize>>();
+        map<string, Pool> $pools = map<string, Pool>();
+        // commands every primary runs, sent by themselves after the rest
+        array<usize> $everywhere = array<usize>();
+        array<Reply> $replies = arr::room<Reply>($count);
+        usize $i = 0;
+        while ($i < $count) {
+            $replies->push(Reply::nil);
+            $i++;
+        }
+        $i = 0;
+        while ($i < $count) {
+            if (!$batch->commands[$i]->keyed()) {
+                Reach $reach = reach($batch->commands[$i]);
+                if ($reach == Reach::refused) {
+                    $batch->fail(refusal($batch->commands[$i]));
+                    return;
+                }
+                if ($reach == Reach::everyPrimary) {
+                    $everywhere->push($i);
+                    $i++;
+                    continue;
+                }
+            }
+            int32 $slot = guard $this->slotFor($batch->commands[$i], $until) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            Pool $node = guard $this->nodeFor($slot) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            string $address = joinAddress($node->options->host, $node->options->port as int64);
+            if (!$byNode->has($address)) {
+                $byNode[$address] = array<usize>();
+                $pools[$address] = $node;
+            }
+            $byNode[$address]->push($i);
+            $i++;
+        }
+        foreach ($byNode as $address => const &$indices) {
+            Batch $part = Batch();
+            foreach ($indices as const &$at) {
+                $part->commands->push($batch->commands[$at]);
+            }
+            $pools[$address]->exchange($part, $by);
+            guard $part->outcome() else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            usize $j = 0;
+            while ($j < $indices->count()) {
+                usize $at = $indices[$j];
+                ServerError? $no = $part->replies[$j]->failure();
+                bool $redirected = false;
+                if ($no != null) {
+                    ServerError $s = guard $no;
+                    $redirected = $s->code == 'MOVED' || $s->code == 'ASK' || $s->code == 'TRYAGAIN';
+                }
+                if ($redirected) {
+                    // sent on by itself, through the redirects
+                    guard $this->alone($batch->commands[$at], $replies[$at], $by) else ($e) {
+                        $batch->fail($e);
+                        return;
+                    }
+                } else {
+                    $replies[$at] = $part->replies[$j];
+                }
+                $j++;
+            }
+        }
+        foreach ($everywhere as $at) {
+            guard $this->alone($batch->commands[$at], $replies[$at], $by) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+        }
+        $batch->settle(mv $replies);
+    }
+
+    /**
+     * Send one of a batch's commands by itself, its reply into `$reply`. An error reply is its
+     * reply; any other failure is the batch's.
+     */
+    private function alone(const Command& $command, Reply& $reply, tcp::Deadline? $by) : status<Error>
+    {
+        result<Reply, Error> $again = $this->call($command, by: $by);
+        if (!$again->failed()) {
+            $reply = $again->unwrap();
+            return .ok;
+        }
+        ServerError $why = guard $again->failure()->server() else {
+            return .error($again->failure());
+        }
+        $reply = Reply::error($why);
+        return .ok;
+    }
+
+    internal function transact(Batch $batch, tcp::Deadline? $by) : void
+    {
+        tcp::Deadline $until = $this->options->deadline($by, null);
+        int32 $slot = -1;
+        foreach ($batch->commands as const &$c) {
+            if (!$c->keyed() && reach($c) != Reach::anyPrimary) {
+                $batch->fail(.unroutable("{$c->name()} cannot run in a cluster transaction: it is not one primary's to answer"));
+                return;
+            }
+            int32 $s = guard $this->slotFor($c, $until) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            if ($s >= 0) {
+                if ($slot >= 0 && $s != $slot) {
+                    $batch->fail(.crossSlot);
+                    return;
+                }
+                $slot = $s;
+            }
+        }
+        uint32 $tries = 0;
+        while (true) {
+            Pool $node = guard $this->nodeFor($slot) else ($e) {
+                $batch->fail($e);
+                return;
+            }
+            Batch $attempt = Batch();
+            $attempt->commands = $batch->commands;
+            $node->transact($attempt, $by);
+            guard $attempt->outcome() else ($e) {
+                // queued on a node that no longer serves the slot: learn the map, try again
+                bool $moved = $e->is('EXECABORT') && ($e->server()?->message ?? '')->contains('MOVED');
+                if ($moved && $tries < $this->limits->maxRedirects) {
+                    $tries++;
+                    status<Error> $seen = $this->refresh($this->options->deadline($by, null));
+                    continue;
+                }
+                $batch->fail($e);
+                return;
+            }
+            // moved across, not copied: EXEC's replies can be large
+            array<Reply> $done = array<Reply>();
+            $done->take_from($attempt->replies);
+            $batch->settle(mv $done);
+            return;
+        }
+    }
+}
+
+/**
+ * Where a command without keys goes on a cluster.
+ */
+internal enum Reach
+{
+    /**
+     * Any one primary answers it for all of them: `PING`, `INFO`, `TIME`.
+     */
+    case anyPrimary;
+
+    /**
+     * Every primary has to run it: flushing, loading or removing scripts and functions.
+     */
+    case everyPrimary;
+
+    /**
+     * One primary would answer for its own keys as if they were the cluster's: `KEYS`, `SCAN`.
+     */
+    case refused;
+}
+
+/**
+ * Where the keyless `$command` goes on a cluster.
+ */
+internal function reach(const Command& $command) : Reach
+{
+    string $name = $command->name();
+    if ($name == 'KEYS' || $name == 'SCAN' || $name == 'DBSIZE' || $name == 'RANDOMKEY') {
+        return Reach::refused;
+    }
+    if ($name == 'FLUSHDB' || $name == 'FLUSHALL') {
+        return Reach::everyPrimary;
+    }
+    if ($name != 'SCRIPT' && $name != 'FUNCTION') {
+        return Reach::anyPrimary;
+    }
+    array<string> $args = $command->args();
+    if ($args->count() < 2) {
+        return Reach::anyPrimary;
+    }
+    string $sub = str::upper($args[1]);
+    if ($sub == 'LOAD' || $sub == 'FLUSH') {
+        return Reach::everyPrimary;
+    }
+    if ($name == 'FUNCTION' && ($sub == 'DELETE' || $sub == 'RESTORE')) {
+        return Reach::everyPrimary;
+    }
+    return Reach::anyPrimary;
+}
+
+/**
+ * Why a cluster refuses `$command`, and what to do instead.
+ */
+internal function refusal(const Command& $command) : Error
+{
+    return .unroutable("{$command->name()} spans every primary: run it on each of primaries()");
+}
+
+/**
+ * Where a `MOVED` or an `ASK` points: `MOVED 3999 127.0.0.1:6381`.
+ */
+internal struct Redirect
+{
+    internal uint16 $slot;
+    // host:port, as the cluster's map keys it
+    internal string $address;
+    internal HostPort $node;
+
+    /**
+     * The redirect in an error reply from a node on `$asked`. A node that does not know its own
+     * address answers `:port`, which is on `$asked` too.
+     */
+    internal static function parse(const ServerError& $s, const string& $asked) : result<Redirect, Error>
+    {
+        usize $space = $s->message->find(' ');
+        if ($space >= $s->message->size()) {
+            return .error(.malformed("a redirect without an address: {$s->code} {$s->message}"));
+        }
+        uint64 $slot = guard str::uint($s->message->sub(0, $space)) else {
+            return .error(.malformed("a redirect without a slot: {$s->code} {$s->message}"));
+        }
+        if ($slot >= SLOTS as uint64) {
+            return .error(.malformed("a redirect to slot {$slot}"));
+        }
+        string $address = $s->message->sub($space + 1, $s->message->size() - $space - 1);
+        if ($address->starts(':')) {
+            string $host = $asked;
+            if ($host->contains(':')) {
+                $host = "[{$asked}]";
+            }
+            $address = "{$host}{$address}";
+        }
+        HostPort $hp = guard splitAddress($address) else {
+            return .error(.malformed("a redirect to '{$address}', which is not host:port"));
+        }
+        return .ok(Redirect($slot as uint16, joinAddress($hp->host, $hp->port as int64), $hp));
+    }
+}
+
+/**
+ * Slots `start` to `end` and the primary serving them, from `CLUSTER SLOTS`.
+ */
+internal struct SlotRange
+{
+    internal uint32 $start;
+    internal uint32 $end;
+    internal HostPort $node;
+
+    /**
+     * `CLUSTER SLOTS`: `[[start, end, [host, port, id, ...], replicas...], ...]`. A primary
+     * without a host (`''` or `?`) is the node that was asked, at `$asked`.
+     */
+    internal static function parse(const Reply& $r, const string& $asked) : result<array<SlotRange>, Error>
+    {
+        array<Reply> $items = guard $r->items() else {
+            return .error(Decode::wrong($r, 'the slot map'));
+        }
+        array<SlotRange> $out = arr::room<SlotRange>($items->count());
+        foreach ($items as const &$item) {
+            array<Reply> $parts = guard $item->items() else {
+                return .error(Decode::wrong($item, 'a slot range'));
+            }
+            if ($parts->count() < 3) {
+                return .error(Decode::wrong($item, 'a slot range'));
+            }
+            int64 $start = guard $parts[0]->int() else {
+                return .error(Decode::wrong($parts[0], 'a slot'));
+            }
+            int64 $end = guard $parts[1]->int() else {
+                return .error(Decode::wrong($parts[1], 'a slot'));
+            }
+            if ($start < 0 || $end < $start || $end >= SLOTS as int64) {
+                return .error(.malformed("slots {$start} to {$end}"));
+            }
+            array<Reply> $primary = guard $parts[2]->items() else {
+                return .error(Decode::wrong($parts[2], 'a node'));
+            }
+            if ($primary->count() < 2) {
+                return .error(Decode::wrong($parts[2], 'a node'));
+            }
+            string $host = $primary[0]->text() ?? '';
+            int64 $port = guard $primary[1]->int() else {
+                return .error(Decode::wrong($primary[1], 'a port'));
+            }
+            if ($host->empty() || $host == '?') {
+                $host = $asked;
+            }
+            if ($port < 1 || $port > 65535) {
+                return .error(.malformed("a node on port {$port}"));
+            }
+            $out->push(SlotRange($start as uint32, $end as uint32, HostPort($host, $port as uint16)));
+        }
+        return .ok($out);
+    }
+}
+
+internal struct HostPort
+{
+    internal string $host;
+    internal uint16 $port;
+}
+
+/**
+ * `host:port` or `[v6]:port`.
+ */
+internal function splitAddress(const string& $address) : result<HostPort, Error>
+{
+    usize $colon = lastOf($address, 58);
+    if ($colon >= $address->size() || $colon == 0) {
+        return .error(.invalid("'{$address}' is not host:port"));
+    }
+    string $host = $address->sub(0, $colon);
+    if ($host->starts('[') && $host->ends(']')) {
+        $host = $host->sub(1, $host->size() - 2);
+    }
+    uint16 $p = try port($address->sub($colon + 1, $address->size() - $colon - 1));
+    return .ok(HostPort($host, $p));
+}
+
+internal function joinAddress(const string& $host, int64 $port) : string
+{
+    if ($host->contains(':')) {
+        return "[{$host}]:{$port}";
+    }
+    return "{$host}:{$port}";
+}
+
+/**
+ * The time left before `$until`, or `$fallback` when it never passes. At least a millisecond.
+ */
+internal function remainingOr(tcp::Deadline $until, time::duration $fallback) : time::duration
+{
+    time::duration $left = guard $until->remaining() else {
+        return $fallback;
+    }
+    if ($left->as_millis() < 1) {
+        return time::duration::millis(1);
+    }
+    return $left;
+}

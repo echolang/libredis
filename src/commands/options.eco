@@ -1,0 +1,440 @@
+/**
+ * The arguments typed commands take beyond keys and values: expiries, conditions, ranges, trims.
+ */
+
+namespace redis;
+
+use std::time;
+
+/**
+ * When a key expires: after a while, at a moment, or the expiry it has kept (`SET ... KEEPTTL`)
+ * or taken away (`GETEX ... PERSIST`).
+ */
+public struct Expiry
+{
+    private ExpiryKind $kind;
+
+    /**
+     * Expire `$ttl` from now, to the millisecond.
+     */
+    public constructor(after: time::duration $ttl)
+    {
+        $this->kind = .after($ttl->as_millis());
+    }
+
+    /**
+     * Expire at a Unix time in milliseconds.
+     */
+    public constructor(atUnixMillis: int64 $at)
+    {
+        $this->kind = .at($at);
+    }
+
+    private constructor(kind: ExpiryKind $kind)
+    {
+        $this->kind = $kind;
+    }
+
+    /**
+     * Keep the expiry the key has (`SET` only).
+     */
+    public static function keep() : Expiry
+    {
+        return Expiry(kind: .keep);
+    }
+
+    /**
+     * Take the expiry away (`GETEX` only).
+     */
+    public static function persist() : Expiry
+    {
+        return Expiry(kind: .persist);
+    }
+
+    internal const function into(Command& $c) : void
+    {
+        match ($this->kind) {
+            ExpiryKind::after($ms) => {
+                $c->arg('PX')->arg($ms);
+            },
+            ExpiryKind::at($ms) => {
+                $c->arg('PXAT')->arg($ms);
+            },
+            ExpiryKind::keep => {
+                $c->arg('KEEPTTL');
+            },
+            ExpiryKind::persist => {
+                $c->arg('PERSIST');
+            },
+        }
+    }
+}
+
+internal enum ExpiryKind
+{
+    case after(int64 $ms);
+    case at(int64 $ms);
+    case keep;
+    case persist;
+}
+
+/**
+ * When a write goes ahead, by what is there now: `nx` only when it is not (a new key, a new
+ * member, no expiry yet), `xx` only when it is, `gt` and `lt` only when the new value is greater
+ * or less (an expiry, a score).
+ */
+public enum Condition
+{
+    case nx;
+    case xx;
+    case gt;
+    case lt;
+
+    internal const function word() : string
+    {
+        return match ($this) {
+            Condition::nx => 'NX',
+            Condition::xx => 'XX',
+            Condition::gt => 'GT',
+            Condition::lt => 'LT',
+        };
+    }
+}
+
+internal enum RangeKind
+{
+    case index;
+    case score;
+    case lex;
+}
+
+/**
+ * How `set` writes.
+ */
+public struct SetOptions
+{
+    public Expiry? $expiry = null;
+
+    /**
+     * `nx` or `xx`. When the condition stops the write, `set` answers false.
+     */
+    public Condition? $condition = null;
+
+    internal const function into(Command& $c) : void
+    {
+        $this->expiry?->into($c);
+        Condition? $w = $this->condition;
+        if ($w != null) {
+            Condition $cond = guard $w;
+            $c->arg($cond->word());
+        }
+    }
+}
+
+/**
+ * An end of a list: `LEFT` is the head, `RIGHT` the tail.
+ */
+public enum Side
+{
+    case left;
+    case right;
+
+    internal const function word() : string
+    {
+        return match ($this) {
+            Side::left => 'LEFT',
+            Side::right => 'RIGHT',
+        };
+    }
+}
+
+/**
+ * Where `linsert` puts the value: before or after the pivot.
+ */
+public enum Position
+{
+    case before;
+    case after;
+
+    internal const function word() : string
+    {
+        return match ($this) {
+            Position::before => 'BEFORE',
+            Position::after => 'AFTER',
+        };
+    }
+}
+
+/**
+ * One end of a range of sorted set scores or names, as the server writes it: `5`, `(5`, `-inf`,
+ * `[apple`, `(apple`, `-`, `+`.
+ */
+public struct Bound
+{
+    internal string $text;
+
+    /**
+     * A score. `exclusive` leaves the score itself out. `-inf` and `inf` are the ends.
+     */
+    public constructor(score: float64 $score, exclusive: bool $exclusive = false)
+    {
+        string $t = floatArg($score);
+        if ($exclusive) {
+            $t = "({$t}";
+        }
+        $this->text = $t;
+    }
+
+    /**
+     * A member name, for the lexicographic ranges. `exclusive` leaves the name itself out.
+     */
+    public constructor(lex: const string& $name, exclusive: bool $exclusive = false)
+    {
+        string $t = '[';
+        if ($exclusive) {
+            $t = '(';
+        }
+        $t->append($name);
+        $this->text = $t;
+    }
+
+    /**
+     * Below every name, for the lexicographic ranges: `-`.
+     */
+    public static function first() : Bound
+    {
+        Bound $b = Bound(lex: '');
+        $b->text = '-';
+        return $b;
+    }
+
+    /**
+     * Above every name, for the lexicographic ranges: `+`.
+     */
+    public static function last() : Bound
+    {
+        Bound $b = Bound(lex: '');
+        $b->text = '+';
+        return $b;
+    }
+}
+
+/**
+ * Which members of a sorted set `zrange` takes: by rank, by score, or by name, lowest first or
+ * (`rev`) highest first, all of them or a page (`limit`).
+ *
+ * ```echo
+ * $top = redis::ZRange(index: 0, 9);
+ * $top->rev = true;
+ * $cheap = redis::ZRange(score: redis::Bound(score: 0.0), redis::Bound(score: 10.0, exclusive: true));
+ * ```
+ */
+public struct ZRange
+{
+    private RangeKind $by = RangeKind::index;
+    private string $start;
+    private string $stop;
+    private int64 $offset = 0;
+    private int64 $count = -1;
+
+    /**
+     * Highest first. The bounds stay low to high: `zrange` turns them round.
+     */
+    public bool $rev = false;
+
+    /**
+     * By rank, from 0; negative counts from the end, -1 being the last.
+     */
+    public constructor(index: int64 $start, int64 $stop)
+    {
+        $this->by = .index;
+        $this->start = str::from($start);
+        $this->stop = str::from($stop);
+    }
+
+    /**
+     * By score, from `$min` to `$max`.
+     */
+    public constructor(score: const Bound& $min, const Bound& $max)
+    {
+        $this->by = .score;
+        $this->start = $min->text;
+        $this->stop = $max->text;
+    }
+
+    /**
+     * By name, from `$min` to `$max`, for a set whose members all have one score.
+     */
+    public constructor(lex: const Bound& $min, const Bound& $max)
+    {
+        $this->by = .lex;
+        $this->start = $min->text;
+        $this->stop = $max->text;
+    }
+
+    /**
+     * Only `$count` members, after skipping `$offset`. By score or by name only.
+     */
+    public function limit(int64 $offset, int64 $count) : ZRange&
+    {
+        $this->offset = $offset;
+        $this->count = $count;
+        return $this;
+    }
+
+    internal const function into(Command& $c) : void
+    {
+        // the server takes a reversed score or name range high to low
+        if ($this->rev && $this->by != RangeKind::index) {
+            $c->arg($this->stop)->arg($this->start);
+        } else {
+            $c->arg($this->start)->arg($this->stop);
+        }
+        if ($this->by == RangeKind::score) {
+            $c->arg('BYSCORE');
+        } else if ($this->by == RangeKind::lex) {
+            $c->arg('BYLEX');
+        }
+        if ($this->rev) {
+            $c->arg('REV');
+        }
+        if ($this->count >= 0) {
+            $c->arg('LIMIT')->arg($this->offset)->arg($this->count);
+        }
+    }
+}
+
+/**
+ * How `zadd` writes.
+ */
+public struct ZAddOptions
+{
+    /**
+     * `nx` adds new members only, `xx` updates existing ones only, `gt` and `lt` update a score
+     * only upwards or downwards (new members are still added).
+     */
+    public Condition? $condition = null;
+
+    /**
+     * Count the members whose score changed too, not only the new ones.
+     */
+    public bool $changed = false;
+
+    internal const function into(Command& $c) : void
+    {
+        Condition? $w = $this->condition;
+        if ($w != null) {
+            Condition $cond = guard $w;
+            $c->arg($cond->word());
+        }
+        if ($this->changed) {
+            $c->arg('CH');
+        }
+    }
+}
+
+/**
+ * How far to trim a stream: down to a length, or to entries from an id on. Approximate (`~`) by
+ * default, which lets the server trim whole nodes and is much cheaper.
+ */
+public struct Trim
+{
+    private bool $byLength;
+    private string $threshold;
+
+    public bool $approximate = true;
+
+    public constructor(maxLen: uint64 $length)
+    {
+        $this->byLength = true;
+        $this->threshold = str::from($length);
+    }
+
+    public constructor(minId: const string& $id)
+    {
+        $this->byLength = false;
+        $this->threshold = $id;
+    }
+
+    internal const function into(Command& $c) : void
+    {
+        if ($this->byLength) {
+            $c->arg('MAXLEN');
+        } else {
+            $c->arg('MINID');
+        }
+        if ($this->approximate) {
+            $c->arg('~');
+        } else {
+            $c->arg('=');
+        }
+        $c->arg($this->threshold);
+    }
+}
+
+/**
+ * How `xadd` writes.
+ */
+public struct XAddOptions
+{
+    /**
+     * The entry's id. `*` lets the server pick the next one.
+     */
+    public string $id = '*';
+
+    /**
+     * Do not make the stream when it is not there: `xadd` answers null instead.
+     */
+    public bool $noMkStream = false;
+
+    public Trim? $trim = null;
+
+    internal const function into(Command& $c) : void
+    {
+        if ($this->noMkStream) {
+            $c->arg('NOMKSTREAM');
+        }
+        $this->trim?->into($c);
+        $c->arg($this->id);
+    }
+}
+
+/**
+ * What a `scan`, `sscan`, `hscan` or `zscan` page looks at.
+ */
+public struct ScanOptions
+{
+    /**
+     * A glob the names have to match: `user:*`.
+     */
+    public string? $pattern = null;
+
+    /**
+     * About how much work one page does. The server may answer with more or fewer.
+     */
+    public uint32? $count = null;
+
+    /**
+     * Keys of this type only: `string`, `hash`, `zset`... (`scan` only).
+     */
+    public string? $type = null;
+
+    internal const function into(Command& $c) : void
+    {
+        string? $m = $this->pattern;
+        if ($m != null) {
+            string $glob = guard $m;
+            $c->arg('MATCH')->arg($glob);
+        }
+        uint32? $n = $this->count;
+        if ($n != null) {
+            uint32 $count = guard $n;
+            $c->arg('COUNT')->arg($count as int64);
+        }
+        string? $t = $this->type;
+        if ($t != null) {
+            string $type = guard $t;
+            $c->arg('TYPE')->arg($type);
+        }
+    }
+}
